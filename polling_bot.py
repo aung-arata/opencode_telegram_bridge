@@ -50,7 +50,13 @@ def send_message(chat_id, text):
     url = f"{API_URL}/sendMessage"
     data = {'chat_id': chat_id, 'text': text}
     try:
-        requests.post(url, data=data, timeout=5)
+        resp = requests.post(url, data=data, timeout=5)
+        if resp.status_code != 200:
+            print(f"[send_message] HTTP {resp.status_code} sending to chat_id={chat_id}: {resp.text}")
+        else:
+            result = resp.json()
+            if not result.get('ok'):
+                print(f"[send_message] Telegram API error: {result}")
     except Exception as e:
         print(f"Error sending message: {e}")
 
