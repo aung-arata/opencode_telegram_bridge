@@ -21,6 +21,7 @@ TG_USER_ID=123456789
 ```
 
 - Bot replies to the chat where the command was received (works for private and group chats, but only you can control it).
+- Bot state (last update processed) is stored in `runtime/last_update_id.txt`, which is ignored by git and safe to remove/reset at any time.
 
 ## License
 MIT

@@ -25,7 +25,12 @@ if not BOT_TOKEN or not USER_ID:
 
 # Only commands from USER_ID will be accepted. Replies are sent to the triggering chat, so this works in private and group chats.
 
-LAST_UPDATE_FILE = 'last_update_id.txt'
+RUNTIME_DIR = 'runtime'
+LAST_UPDATE_FILE = os.path.join(RUNTIME_DIR, 'last_update_id.txt')
+# Stores polling bot state (safe to remove for reset)
+
+# Ensure the runtime directory exists
+ios.makedirs(RUNTIME_DIR, exist_ok=True)
 
 
 def get_updates(offset=None):
