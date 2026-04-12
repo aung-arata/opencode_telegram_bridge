@@ -6,8 +6,9 @@ def load_env(path):
     try:
         with open(path) as f:
             for line in f:
-                if line.strip() and not line.startswith('#'):
-                    key, val = line.strip().split('=', 1)
+                stripped = line.strip()
+                if stripped and not stripped.startswith('#') and '=' in stripped:
+                    key, val = stripped.split('=', 1)
                     os.environ.setdefault(key, val)
     except Exception as e:
         print(f"Warning: could not load .env file: {e}")
@@ -30,13 +31,13 @@ LAST_UPDATE_FILE = os.path.join(RUNTIME_DIR, 'last_update_id.txt')
 # Stores polling bot state (safe to remove for reset)
 
 # Ensure the runtime directory exists
-ios.makedirs(RUNTIME_DIR, exist_ok=True)
+os.makedirs(RUNTIME_DIR, exist_ok=True)
 
 
 def get_updates(offset=None):
     url = f"{API_URL}/getUpdates"
     params = {'timeout': 5}
-    if offset:
+    if offset is not None:
         params['offset'] = offset
     try:
         resp = requests.get(url, params=params, timeout=10)
@@ -90,7 +91,10 @@ def main():
         for update in updates:
             if 'message' in update:
                 msg = update['message']
-                sender_id = str(msg['from']['id'])
+                sender = msg.get('from')
+                if sender is None:
+                    continue
+                sender_id = str(sender['id'])
                 chat_id = str(msg['chat']['id'])
                 text = msg.get('text', '')
 
