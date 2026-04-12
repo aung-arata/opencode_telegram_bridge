@@ -86,6 +86,7 @@ def main():
     print("Bot started. Waiting for commands...")
     while True:
         updates = get_updates(offset=last_update_id + 1)
+        max_update_id = last_update_id
         for update in updates:
             if 'message' in update:
                 msg = update['message']
@@ -104,9 +105,10 @@ def main():
                         send_message(chat_id, help_msg)
                 # Optionally add else: send_message(chat_id, "Unauthorized")
 
-            # Always update last_update_id
-            last_update_id = max(last_update_id, update['update_id'])
-            save_last_update_id(last_update_id)
+            max_update_id = max(max_update_id, update['update_id'])
+        if max_update_id != last_update_id:
+            save_last_update_id(max_update_id)
+            last_update_id = max_update_id
         time.sleep(2)
 
 if __name__ == "__main__":
