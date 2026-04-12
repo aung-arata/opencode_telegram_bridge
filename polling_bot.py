@@ -64,8 +64,15 @@ def load_last_update_id():
     try:
         with open(LAST_UPDATE_FILE) as f:
             return int(f.read().strip())
-    except:
+    except FileNotFoundError:
+        return 0  # expected if no state yet
+    except ValueError as ve:
+        print(f"[load_last_update_id] Invalid contents in {LAST_UPDATE_FILE}: {ve}")
         return 0
+    except OSError as oe:
+        print(f"[load_last_update_id] OS error on {LAST_UPDATE_FILE}: {oe}")
+        return 0
+    # Let KeyboardInterrupt, SystemExit, etc. propagate
 
 def save_last_update_id(update_id):
     try:
