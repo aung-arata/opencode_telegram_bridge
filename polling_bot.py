@@ -14,8 +14,10 @@ def load_env(path):
 
 load_env('.env')
 BOT_TOKEN = os.environ.get('TG_BOT_TOKEN', '')
-CHAT_ID = os.environ.get('TG_CHAT_ID', '')
+USER_ID = os.environ.get('TG_USER_ID', '')
 API_URL = f'https://api.telegram.org/bot{BOT_TOKEN}'
+
+# Only commands from USER_ID will be accepted. Replies are sent to the triggering chat, so this works in private and group chats.
 
 LAST_UPDATE_FILE = 'last_update_id.txt'
 
@@ -67,7 +69,7 @@ def main():
                 chat_id = str(msg['chat']['id'])
                 text = msg.get('text', '')
 
-                if sender_id == CHAT_ID:
+                if sender_id == USER_ID:
                     if text.startswith('/echo '):
                         reply = text[6:]
                         send_message(chat_id, reply)
