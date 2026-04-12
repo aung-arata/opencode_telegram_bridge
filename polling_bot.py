@@ -12,10 +12,16 @@ def load_env(path):
     except Exception as e:
         print(f"Warning: could not load .env file: {e}")
 
+import sys
 load_env('.env')
 BOT_TOKEN = os.environ.get('TG_BOT_TOKEN', '')
 USER_ID = os.environ.get('TG_USER_ID', '')
 API_URL = f'https://api.telegram.org/bot{BOT_TOKEN}'
+
+# Validate config
+if not BOT_TOKEN or not USER_ID:
+    print("Error: TG_BOT_TOKEN and TG_USER_ID must be set in .env. Exiting.")
+    sys.exit(1)
 
 # Only commands from USER_ID will be accepted. Replies are sent to the triggering chat, so this works in private and group chats.
 
