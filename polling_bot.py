@@ -342,7 +342,7 @@ def main():
                     elif text.startswith('/session'):
                         parts = text.split(None, 1)
                         arg = parts[1].strip() if len(parts) > 1 else ''
-                        if arg in ('end', ''):
+                        if arg == 'end':
                             old = _session_key
                             _session_key = None
                             log(f"SESSION: cleared (was {old!r})")
@@ -351,7 +351,7 @@ def main():
                                 "✅ Session cleared. Now using subprocess-per-query mode.",
                                 reply_to_message_id=msg_id,
                             )
-                        elif arg == 'status':
+                        elif arg == '' or arg == 'status':
                             if _session_key:
                                 reply = f"Active session: {_session_key}"
                             else:

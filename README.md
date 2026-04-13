@@ -1,6 +1,6 @@
 # opencode_telegram_bridge
 
-A simple Python Telegram bot script for sending notifications and proxying messages to a local [OpenCode](https://opencode.ai) process. Uses only well-known packages (`requests`).
+A simple Python Telegram bot script for sending notifications and proxying messages to a local [OpenCode](https://opencode.ai) process. Uses only standard library modules plus the `requests` package (no other external dependencies).
 
 ---
 
