@@ -3,6 +3,7 @@ import queue
 import requests
 import os
 import shlex
+import socket as _socket_mod
 import subprocess
 import threading
 import time
@@ -74,6 +75,12 @@ def log(msg):
         pass
 
 # ---------------------------------------------------------------------------
+# Session state  (None = subprocess-per-query; str = Unix socket path)
+# ---------------------------------------------------------------------------
+
+_session_key = None  # set via /session <key>, cleared via /session end
+
+# ---------------------------------------------------------------------------
 # OpenCode subprocess bridge
 # ---------------------------------------------------------------------------
 
@@ -120,9 +127,17 @@ def start_opencode():
 
 
 def query_opencode(text):
-    """Send *text* to the OpenCode subprocess and return its response."""
+    """Send *text* to OpenCode and return its response.
+
+    Routes to a persistent Unix socket session when one is active, otherwise
+    falls back to spawning (or reusing) a local subprocess.
+    """
     global _oc_proc
     with _oc_lock:
+        if _session_key is not None:
+            return _query_via_socket(text, _session_key)
+
+        # ---- subprocess mode ----
 
         # (Re-)start process if needed
         if _oc_proc is None or _oc_proc.poll() is not None:
@@ -141,7 +156,7 @@ def query_opencode(text):
                 break
 
         # Write the query
-        log(f"QUERY: {text}")
+        log(f"QUERY [subprocess]: {text}")
         try:
             _oc_proc.stdin.write(text + '\n')
             _oc_proc.stdin.flush()
@@ -169,8 +184,64 @@ def query_opencode(text):
         response = '\n'.join(lines).strip()
         if not response:
             response = "(no response from OpenCode)"
-        log(f"RESPONSE ({len(lines)} lines): {response[:LOG_RESPONSE_MAX_LEN]}{'…' if len(response) > LOG_RESPONSE_MAX_LEN else ''}")
+        log(f"RESPONSE subprocess ({len(lines)} lines): {response[:LOG_RESPONSE_MAX_LEN]}{'…' if len(response) > LOG_RESPONSE_MAX_LEN else ''}")
         return response
+
+
+def _query_via_socket(text, sock_path):
+    """Send *text* to a persistent OpenCode process via a Unix domain socket.
+
+    The protocol is line-oriented plain text:
+    - Client sends: query text + newline
+    - Server replies with one or more lines, then goes silent (or closes the connection)
+    Response collection stops after OPENCODE_IDLE_TIMEOUT seconds of silence or
+    OPENCODE_RESPONSE_TIMEOUT seconds total.
+    """
+    log(f"QUERY [session={sock_path!r}]: {text}")
+    try:
+        with _socket_mod.socket(_socket_mod.AF_UNIX, _socket_mod.SOCK_STREAM) as sock:
+            sock.settimeout(OPENCODE_RESPONSE_TIMEOUT)
+            sock.connect(sock_path)
+            sock.sendall((text + '\n').encode())
+
+            # Switch to idle-timeout for receiving
+            sock.settimeout(OPENCODE_IDLE_TIMEOUT)
+            buf = b''
+            deadline = time.time() + OPENCODE_RESPONSE_TIMEOUT
+            while time.time() < deadline:
+                try:
+                    chunk = sock.recv(4096)
+                    if not chunk:  # server closed the connection
+                        break
+                    buf += chunk
+                except (TimeoutError, OSError):
+                    # No more data within idle_timeout — response is complete
+                    break
+
+        lines = buf.decode(errors='replace').splitlines()
+        response = '\n'.join(lines).strip()
+        if not response:
+            response = "(no response from OpenCode session)"
+        log(f"RESPONSE session ({len(lines)} lines): {response[:LOG_RESPONSE_MAX_LEN]}{'…' if len(response) > LOG_RESPONSE_MAX_LEN else ''}")
+        return response
+
+    except FileNotFoundError:
+        log(f"SESSION ERROR: socket not found: {sock_path!r}")
+        return (
+            f"❌ Session socket not found: {sock_path}\n"
+            "Make sure OpenCode is running with the IPC socket enabled.\n"
+            "Use /session end to fall back to subprocess mode."
+        )
+    except ConnectionRefusedError:
+        log(f"SESSION ERROR: connection refused: {sock_path!r}")
+        return (
+            f"❌ Connection refused at {sock_path}\n"
+            "The OpenCode process may have exited.\n"
+            "Use /session end to fall back to subprocess mode."
+        )
+    except Exception as e:
+        log(f"SESSION ERROR [{sock_path!r}]: {e}")
+        return f"❌ IPC error communicating with OpenCode session: {e}"
 
 
 def get_updates(offset=None):
@@ -227,6 +298,7 @@ def save_last_update_id(update_id):
         print(f"Failed to save last update id: {e}")
 
 def main():
+    global _session_key
     last_update_id = load_last_update_id()
     print("Bot started. Waiting for commands...")
     while True:
@@ -245,24 +317,67 @@ def main():
 
                 if sender_id == USER_ID:
                     if text.strip() == '/help':
+                        session_status = (
+                            f"Active session: {_session_key}"
+                            if _session_key else "No active session (subprocess mode)"
+                        )
                         help_msg = (
                             "OpenCode Telegram Bridge\n\n"
-                            "Send any plain message → forwarded to local OpenCode as a query.\n"
-                            "/ask <query>  — explicit OpenCode query\n"
-                            "/echo <msg>   — bot replies with your message\n"
-                            "/help         — show this help\n\n"
+                            "Send any plain message → forwarded to local OpenCode as a query.\n\n"
+                            "Commands:\n"
+                            "/ask <query>         — explicit OpenCode query\n"
+                            "/session <path>      — route queries to a persistent OpenCode\n"
+                            "                       process via Unix socket at <path>\n"
+                            "/session end         — revert to subprocess-per-query mode\n"
+                            "/session status      — show current session\n"
+                            "/echo <msg>          — bot replies with your message\n"
+                            "/help                — show this help\n\n"
+                            f"Status: {session_status}\n"
                             f"Response timeout: {OPENCODE_RESPONSE_TIMEOUT}s  "
                             f"idle cutoff: {OPENCODE_IDLE_TIMEOUT}s\n"
                             f"Log: {LOG_FILE}"
                         )
                         send_message(chat_id, help_msg, reply_to_message_id=msg_id)
+
+                    elif text.startswith('/session'):
+                        parts = text.split(None, 1)
+                        arg = parts[1].strip() if len(parts) > 1 else ''
+                        if arg in ('end', ''):
+                            old = _session_key
+                            _session_key = None
+                            log(f"SESSION: cleared (was {old!r})")
+                            send_message(
+                                chat_id,
+                                "✅ Session cleared. Now using subprocess-per-query mode.",
+                                reply_to_message_id=msg_id,
+                            )
+                        elif arg == 'status':
+                            if _session_key:
+                                reply = f"Active session: {_session_key}"
+                            else:
+                                reply = "No active session (subprocess-per-query mode)."
+                            send_message(chat_id, reply, reply_to_message_id=msg_id)
+                        else:
+                            _session_key = arg
+                            log(f"SESSION: set to {arg!r}")
+                            send_message(
+                                chat_id,
+                                f"✅ Session set to: {arg}\n"
+                                "All queries will now be routed via Unix socket.\n"
+                                "Make sure OpenCode is listening at that path.\n"
+                                "Use /session end to fall back to subprocess mode.",
+                                reply_to_message_id=msg_id,
+                            )
+
                     elif text.startswith('/echo '):
                         send_message(chat_id, text[6:], reply_to_message_id=msg_id)
+
                     elif text.startswith('/ask '):
                         query = text[5:].strip()
                         if query:
                             response = query_opencode(query)
                             send_message(chat_id, response, reply_to_message_id=msg_id)
+
                     elif text and not text.startswith('/'):
                         # Plain message → OpenCode proxy
                         response = query_opencode(text)
