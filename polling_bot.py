@@ -7,8 +7,13 @@ def load_env(path):
         with open(path) as f:
             for line in f:
                 stripped = line.strip()
-                if stripped and not stripped.startswith('#') and '=' in stripped:
-                    key, val = stripped.split('=', 1)
+                if not stripped or stripped.startswith('#') or '=' not in stripped:
+                    continue
+                key, val = stripped.split('=', 1)
+                key = key.strip()
+                # Strip inline comments and surrounding whitespace/quotes from value
+                val = val.split('#')[0].strip().strip('"\'')
+                if key:
                     os.environ.setdefault(key, val)
     except Exception as e:
         print(f"Warning: could not load .env file: {e}")
@@ -43,6 +48,7 @@ def get_updates(offset=None):
         resp = requests.get(url, params=params, timeout=10)
         if resp.status_code == 200:
             return resp.json().get('result', [])
+        print(f"[get_updates] HTTP {resp.status_code}: {resp.text}")
     except Exception as e:
         print(f"Error getting updates: {e}")
     return []
@@ -76,9 +82,11 @@ def load_last_update_id():
     # Let KeyboardInterrupt, SystemExit, etc. propagate
 
 def save_last_update_id(update_id):
+    tmp_file = LAST_UPDATE_FILE + '.tmp'
     try:
-        with open(LAST_UPDATE_FILE, 'w') as f:
+        with open(tmp_file, 'w') as f:
             f.write(str(update_id))
+        os.replace(tmp_file, LAST_UPDATE_FILE)
     except Exception as e:
         print(f"Failed to save last update id: {e}")
 
