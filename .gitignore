@@ -1,2 +1,4 @@
+runtime/
+last_update_id.txt
 .env
 __pycache__/

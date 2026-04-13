@@ -9,7 +9,21 @@ python3 send_telegram.py "Your message text here"
 ```
 
 ## Configuration
-- Edit `BOT_TOKEN` and `CHAT_ID` at the top of `send_telegram.py` as needed.
+- Add a `.env` file to the project root with:
+  - `TG_BOT_TOKEN` — your Telegram bot token
+  - `TG_USER_ID`   — your personal Telegram numeric user ID (commands only accepted from this user, used by `polling_bot.py`)
+  - `TG_CHAT_ID`   — target chat/channel ID where `send_telegram.py` sends notifications
+
+Example `.env`:
+
+```
+TG_BOT_TOKEN=123456:abcdeFghijKLMNOPqrs_tuvwxYZ
+TG_USER_ID=123456789
+TG_CHAT_ID=123456789
+```
+
+- Bot replies to the chat where the command was received (works for private and group chats, but only you can control it).
+- Bot state (last update processed) is stored in `runtime/last_update_id.txt`, which is ignored by git and safe to remove/reset at any time.
 
 ## License
 MIT
