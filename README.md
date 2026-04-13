@@ -29,7 +29,7 @@ python3 polling_bot.py
 1. Any plain-text message you send to the bot (not starting with `/`) is written to OpenCode's stdin.
 2. The bot waits for OpenCode to respond (up to `OPENCODE_RESPONSE_TIMEOUT` seconds, cutting off after `OPENCODE_IDLE_TIMEOUT` seconds of silence).
 3. The response is sent back to you as a reply in Telegram.
-4. Requests are serialised (queued), so concurrent messages are handled one at a time.
+4. Requests are serialized (queued), so concurrent messages are handled one at a time.
 5. All queries and responses are logged with timestamps to `runtime/oc_bridge.log`.
 
 **Bot commands:**

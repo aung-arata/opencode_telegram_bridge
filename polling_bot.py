@@ -53,6 +53,8 @@ OPENCODE_IDLE_TIMEOUT = float(os.environ.get('OPENCODE_IDLE_TIMEOUT', '2.0'))
 # Hard cap: total seconds to wait for any response before giving up
 OPENCODE_RESPONSE_TIMEOUT = int(os.environ.get('OPENCODE_RESPONSE_TIMEOUT', '30'))
 LOG_FILE = os.path.join(RUNTIME_DIR, 'oc_bridge.log')
+# Max characters of a response to write into the log line
+LOG_RESPONSE_MAX_LEN = 200
 
 # Ensure the runtime directory exists
 os.makedirs(RUNTIME_DIR, exist_ok=True)
@@ -62,7 +64,7 @@ os.makedirs(RUNTIME_DIR, exist_ok=True)
 # ---------------------------------------------------------------------------
 
 def log(msg):
-    ts = datetime.datetime.now().strftime('%Y-%m-%dT%H:%M:%S')
+    ts = datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
     line = f"[{ts}] {msg}"
     print(line)
     try:
@@ -119,8 +121,8 @@ def start_opencode():
 
 def query_opencode(text):
     """Send *text* to the OpenCode subprocess and return its response."""
+    global _oc_proc
     with _oc_lock:
-        global _oc_proc
 
         # (Re-)start process if needed
         if _oc_proc is None or _oc_proc.poll() is not None:
@@ -167,7 +169,7 @@ def query_opencode(text):
         response = '\n'.join(lines).strip()
         if not response:
             response = "(no response from OpenCode)"
-        log(f"RESPONSE ({len(lines)} lines): {response[:200]}{'…' if len(response) > 200 else ''}")
+        log(f"RESPONSE ({len(lines)} lines): {response[:LOG_RESPONSE_MAX_LEN]}{'…' if len(response) > LOG_RESPONSE_MAX_LEN else ''}")
         return response
 
 
