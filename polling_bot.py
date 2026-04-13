@@ -11,8 +11,14 @@ def load_env(path):
                     continue
                 key, val = stripped.split('=', 1)
                 key = key.strip()
-                # Strip inline comments and surrounding whitespace/quotes from value
-                val = val.split('#')[0].strip().strip('"\'')
+                # Strip inline comments (only when preceded by whitespace) and surrounding whitespace
+                val = val.strip()
+                # Remove trailing inline comment: value must have a space before #
+                if ' #' in val:
+                    val = val[:val.index(' #')].strip()
+                # Unquote values with matching surrounding quotes
+                if len(val) >= 2 and val[0] == val[-1] and val[0] in ('"', "'"):
+                    val = val[1:-1]
                 if key:
                     os.environ.setdefault(key, val)
     except Exception as e:
