@@ -16,11 +16,26 @@ import (
 	"github.com/aung-arata/opencode-telegram-bridge/internal/logger"
 )
 
+const (
+	// sseInitialBufferSize is the starting capacity of the bufio.Scanner buffer
+	// used when reading SSE streams. Chosen to handle typical event payloads
+	// without reallocation.
+	sseInitialBufferSize = 64 * 1024 // 64 KB
+
+	// sseMaxBufferSize is the upper bound on the scanner buffer. Large LLM
+	// responses (e.g. code blocks) can produce very long data: lines.
+	sseMaxBufferSize = 1024 * 1024 // 1 MB
+
+	// sseLogSnippetLen is the maximum number of bytes logged per SSE data value.
+	sseLogSnippetLen = 120
+)
+
 // Client communicates with the OpenCode HTTP server.
 type Client struct {
 	baseURL        string
 	sessionTimeout time.Duration
-	httpClient     *http.Client
+	httpClient     *http.Client  // used for short-lived POST requests (has Timeout)
+	sseHTTPClient  *http.Client  // used for SSE GET requests (no Timeout)
 	log            *logger.Logger
 
 	mu       sync.Mutex
@@ -33,9 +48,17 @@ func NewClient(baseURL string, sessionTimeout time.Duration, log *logger.Logger)
 		baseURL:        baseURL,
 		sessionTimeout: sessionTimeout,
 		httpClient:     &http.Client{Timeout: sessionTimeout},
+		sseHTTPClient:  &http.Client{}, // no timeout — stream lifetime is bounded by ctx
 		log:            log,
 		sessions:       make(map[int64]string),
 	}
+}
+
+// Close clears the cached sessions. Call on application exit.
+func (c *Client) Close() {
+	c.mu.Lock()
+	c.sessions = make(map[int64]string)
+	c.mu.Unlock()
 }
 
 // createSessionResponse is the JSON returned by POST /session.
@@ -101,13 +124,19 @@ func (c *Client) GetOrCreateSession(ctx context.Context, chatID int64) (string, 
 	return sid, nil
 }
 
+// contentPart represents a single entry in a "parts" array, used in both
+// outgoing message requests and incoming SSE event payloads.
+// Each part has a "type" (e.g. "text", "step-start", "step-finish") and an
+// optional "text" / "content" field carrying the actual message text.
+type contentPart struct {
+	Type    string `json:"type"`
+	Text    string `json:"text"`
+	Content string `json:"content"`
+}
+
 // sendMessageRequest is the JSON body for POST /session/{id}/message.
 type sendMessageRequest struct {
-	Parts []struct {
-		Type    string `json:"type"`
-		Content string `json:"content"`
-		Text    string `json:"text"`
-	} `json:"parts"`
+	Parts []contentPart `json:"parts"`
 }
 
 // SendMessage posts a message to an OpenCode session.
@@ -116,12 +145,10 @@ func (c *Client) SendMessage(ctx context.Context, sessionID, content string) err
 	defer cancel()
 
 	url := c.baseURL + "/session/" + sessionID + "/message"
+	c.log.Log("POST message [session=%s] url=%s", sessionID, url)
+
 	body, err := json.Marshal(sendMessageRequest{
-		Parts: []struct {
-			Type    string `json:"type"`
-			Content string `json:"content"`
-			Text    string `json:"text"`
-		}{
+		Parts: []contentPart{
 			{Type: "text", Content: content, Text: content},
 		},
 	})
@@ -146,45 +173,12 @@ func (c *Client) SendMessage(ctx context.Context, sessionID, content string) err
 		return fmt.Errorf("send message: HTTP %d: %s", resp.StatusCode, string(respBody))
 	}
 
+	c.log.Log("POST message [session=%s] accepted (HTTP %d)", sessionID, resp.StatusCode)
 	return nil
 }
 
 // StreamCallback is called with accumulated text chunks during SSE streaming.
 type StreamCallback func(accumulated string)
-
-// StreamResponse connects to the SSE event stream for a session and calls
-// onChunk with the accumulated response text as it arrives.
-// Returns the final complete response text.
-func (c *Client) StreamResponse(ctx context.Context, sessionID string, onChunk StreamCallback) (string, error) {
-	url := c.baseURL + "/session/" + sessionID + "/events"
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-	if err != nil {
-		return "", fmt.Errorf("stream request: %w", err)
-	}
-	req.Header.Set("Accept", "text/event-stream")
-	req.Header.Set("Cache-Control", "no-cache")
-
-	// Use a dedicated client for SSE streaming — no overall Timeout on the
-	// http.Client (which would kill long-lived streams), but the context
-	// carries a deadline so a stalled stream cannot hang forever.
-	streamCtx, streamCancel := context.WithTimeout(ctx, c.sessionTimeout)
-	defer streamCancel()
-	req = req.WithContext(streamCtx)
-
-	sseClient := &http.Client{}
-	resp, err := sseClient.Do(req)
-	if err != nil {
-		return "", fmt.Errorf("stream connect: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return "", fmt.Errorf("stream: HTTP %d: %s", resp.StatusCode, string(body))
-	}
-
-	return c.readSSE(resp.Body, onChunk)
-}
 
 // sseEvent represents a parsed Server-Sent Event.
 type sseEvent struct {
@@ -198,80 +192,29 @@ func (e sseEvent) dataString() string {
 }
 
 // contentDelta represents JSON fields that may carry text content in SSE data.
-// OpenCode may use "content", "text", or "delta" depending on the response event type.
+// OpenCode may use "content", "text", "delta", or a nested "parts" array
+// depending on the response event type.
 type contentDelta struct {
-	Content string `json:"content"`
-	Text    string `json:"text"`
-	Delta   string `json:"delta"`
+	Content string        `json:"content"`
+	Text    string        `json:"text"`
+	Delta   string        `json:"delta"`
+	Parts   []contentPart `json:"parts"`
 }
 
-// readSSE reads an SSE stream and returns the accumulated response.
-func (c *Client) readSSE(r io.Reader, onChunk StreamCallback) (string, error) {
-	scanner := bufio.NewScanner(r)
-	// SSE data lines can be large (e.g. full code blocks). Use 64KB initial / 1MB max
-	// to avoid scanner buffer overflow on long assistant responses.
-	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
-
-	var accumulated strings.Builder
-	var currentEvent sseEvent
-
-	for scanner.Scan() {
-		line := scanner.Text()
-
-		if line == "" {
-			// Empty line = end of event
-			if len(currentEvent.Data) > 0 {
-				text := c.extractText(currentEvent)
-				if text != "" {
-					accumulated.WriteString(text)
-					if onChunk != nil {
-						onChunk(accumulated.String())
-					}
-				}
-
-				// Check for completion events
-				if isCompletionEvent(currentEvent) {
-					return accumulated.String(), nil
-				}
-			}
-			currentEvent = sseEvent{}
-			continue
-		}
-
-		if strings.HasPrefix(line, "event:") {
-			currentEvent.Event = strings.TrimSpace(strings.TrimPrefix(line, "event:"))
-		} else if strings.HasPrefix(line, "data:") {
-			// Per SSE spec, multiple data: lines are concatenated with newlines.
-			// Preserve payload whitespace; only strip the single optional space
-			// immediately following "data:" per the spec.
-			data := strings.TrimPrefix(line, "data:")
-			data = strings.TrimPrefix(data, " ")
-			currentEvent.Data = append(currentEvent.Data, data)
-		}
-	}
-
-	if err := scanner.Err(); err != nil {
-		return accumulated.String(), fmt.Errorf("SSE read: %w", err)
-	}
-
-	// Stream ended (server closed connection)
-	return accumulated.String(), nil
-}
-
-// extractText extracts displayable text from an SSE event.
-func (c *Client) extractText(evt sseEvent) string {
-	data := evt.dataString()
+// extractText extracts displayable text from a pre-parsed SSE event payload.
+// data is the raw data string; deltaOK reports whether delta was successfully
+// unmarshaled from it.
+func extractText(data string, deltaOK bool, delta *contentDelta) string {
 	if data == "" || data == "[DONE]" {
 		return ""
 	}
 
-	var delta contentDelta
-	if err := json.Unmarshal([]byte(data), &delta); err != nil {
-		// Not JSON — return the raw data as plain text
+	if !deltaOK {
+		// Not JSON — return the raw data as plain text.
 		return data
 	}
 
-	// Try various field names used by different APIs
+	// Try top-level field names used by different APIs.
 	if delta.Content != "" {
 		return delta.Content
 	}
@@ -282,25 +225,168 @@ func (c *Client) extractText(evt sseEvent) string {
 		return delta.Delta
 	}
 
-	return ""
+	// OpenCode wraps response text inside a "parts" array.
+	// Concatenate all parts whose type is "text".
+	var sb strings.Builder
+	for _, part := range delta.Parts {
+		if part.Type != "text" {
+			continue
+		}
+		if part.Text != "" {
+			sb.WriteString(part.Text)
+		} else if part.Content != "" {
+			sb.WriteString(part.Content)
+		}
+	}
+	return sb.String()
 }
 
 // isCompletionEvent returns true if the SSE event signals the end of a response.
-func isCompletionEvent(evt sseEvent) bool {
-	if evt.dataString() == "[DONE]" {
+// eventName is the "event:" field value; data is the raw payload; deltaOK and
+// delta come from a single JSON decode performed by the caller.
+func isCompletionEvent(eventName, data string, deltaOK bool, delta *contentDelta) bool {
+	if data == "[DONE]" {
 		return true
 	}
 
-	eventType := strings.ToLower(evt.Event)
-	switch eventType {
+	switch strings.ToLower(eventName) {
 	case "done", "complete", "message_stop", "message-complete", "finish":
 		return true
+	}
+
+	// OpenCode signals completion via a part with type "step-finish" or "message-finish".
+	if deltaOK {
+		for _, part := range delta.Parts {
+			t := strings.ToLower(part.Type)
+			if t == "step-finish" || t == "message-finish" || t == "finish" {
+				return true
+			}
+		}
 	}
 
 	return false
 }
 
-// Query sends a message to OpenCode and streams the response.
+// StreamResponse opens a per-query SSE connection to /session/{id}/events and
+// streams assistant text until the server closes the connection or a completion
+// event is received. The server closing the stream after delivering its response
+// is treated as a successful end-of-response (not an error).
+func (c *Client) StreamResponse(ctx context.Context, sessionID string, onChunk StreamCallback) (string, error) {
+	url := c.baseURL + "/session/" + sessionID + "/events"
+	c.log.Log("SSE[%s] connecting to %s", sessionID, url)
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return "", fmt.Errorf("stream request: %w", err)
+	}
+	req.Header.Set("Accept", "text/event-stream")
+	req.Header.Set("Cache-Control", "no-cache")
+
+	// Use the dedicated SSE client which has no Timeout: the stream must stay
+	// open for as long as OpenCode needs to generate the response. The caller's
+	// ctx provides the only deadline (cancelled on bot shutdown).
+	resp, err := c.sseHTTPClient.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("stream connect: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return "", fmt.Errorf("stream: HTTP %d: %s", resp.StatusCode, string(body))
+	}
+
+	c.log.Log("SSE[%s] stream connected (HTTP 200)", sessionID)
+	return c.readSSE(resp.Body, sessionID, onChunk)
+}
+
+// readSSE reads an SSE stream and returns the accumulated response text.
+//
+// Termination rules:
+//  1. A completion event is received → return immediately (success).
+//  2. The server closes the stream (EOF) → success; if content was accumulated
+//     it is returned as-is, if not the caller will show a fallback message.
+//  3. Scanner error → return whatever was collected plus the error.
+func (c *Client) readSSE(r io.Reader, sessionID string, onChunk StreamCallback) (string, error) {
+	scanner := bufio.NewScanner(r)
+	// Use the pre-defined buffer constants to handle large SSE payloads (e.g.
+	// full code blocks) without scanner buffer overflow.
+	scanner.Buffer(make([]byte, 0, sseInitialBufferSize), sseMaxBufferSize)
+
+	var accumulated strings.Builder
+	var currentEvent sseEvent
+	eventCount := 0
+
+	for scanner.Scan() {
+		line := scanner.Text()
+
+		if line == "" {
+			// Empty line = end of one SSE event.
+			if len(currentEvent.Data) > 0 {
+				eventCount++
+				data := currentEvent.dataString()
+
+				// Decode JSON once per event; share the result between extractText
+				// and isCompletionEvent to avoid redundant work.
+				var delta contentDelta
+				deltaOK := data != "" && data != "[DONE]" && json.Unmarshal([]byte(data), &delta) == nil
+
+				// Debug: log every event so timing/content issues are visible in logs.
+				c.log.Log("SSE[%s] event #%d type=%q data=%s", sessionID, eventCount,
+					currentEvent.Event, sseDataSnippet(data))
+
+				text := extractText(data, deltaOK, &delta)
+				if text != "" {
+					accumulated.WriteString(text)
+					if onChunk != nil {
+						onChunk(accumulated.String())
+					}
+				}
+
+				if isCompletionEvent(currentEvent.Event, data, deltaOK, &delta) {
+					c.log.Log("SSE[%s] completion event detected after %d events", sessionID, eventCount)
+					return accumulated.String(), nil
+				}
+			}
+			currentEvent = sseEvent{}
+			continue
+		}
+
+		if strings.HasPrefix(line, "event:") {
+			currentEvent.Event = strings.TrimSpace(strings.TrimPrefix(line, "event:"))
+		} else if strings.HasPrefix(line, "data:") {
+			// Per SSE spec: strip the single optional space immediately after "data:".
+			data := strings.TrimPrefix(line, "data:")
+			data = strings.TrimPrefix(data, " ")
+			currentEvent.Data = append(currentEvent.Data, data)
+		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		return accumulated.String(), fmt.Errorf("SSE read error: %w", err)
+	}
+
+	// Server closed the connection (EOF). This is the normal end-of-response
+	// signal for OpenCode: it closes /events once the assistant reply is complete.
+	acc := accumulated.String()
+	if acc != "" {
+		c.log.Log("SSE[%s] stream closed by server after %d events — response complete", sessionID, eventCount)
+	} else {
+		c.log.Log("SSE[%s] stream closed by server with no text content (%d events processed)", sessionID, eventCount)
+	}
+	// Return nil error regardless: EOF is a normal, successful termination.
+	return acc, nil
+}
+
+// sseDataSnippet returns a short excerpt of a raw SSE data string for logging.
+func sseDataSnippet(data string) string {
+	if len(data) <= sseLogSnippetLen {
+		return data
+	}
+	return data[:sseLogSnippetLen] + "…"
+}
+
+// Query sends a message to OpenCode and streams the response back.
 // It handles session creation/reuse for the given Telegram chat ID.
 func (c *Client) Query(ctx context.Context, chatID int64, text string, onChunk StreamCallback) (string, error) {
 	sessionID, err := c.GetOrCreateSession(ctx, chatID)
@@ -311,8 +397,8 @@ func (c *Client) Query(ctx context.Context, chatID int64, text string, onChunk S
 	c.log.Log("QUERY [session=%s, chat=%d]: %s", sessionID, chatID, text)
 
 	if err := c.SendMessage(ctx, sessionID, text); err != nil {
-		// Session might be expired; try creating a new one
-		c.log.Log("SendMessage failed, creating new session: %v", err)
+		// Session might have expired; try creating a new one.
+		c.log.Log("SendMessage failed [session=%s], creating new session: %v", sessionID, err)
 		c.mu.Lock()
 		delete(c.sessions, chatID)
 		c.mu.Unlock()
@@ -327,6 +413,7 @@ func (c *Client) Query(ctx context.Context, chatID int64, text string, onChunk S
 		}
 	}
 
+	c.log.Log("SSE[%s] opening event stream for query", sessionID)
 	response, err := c.StreamResponse(ctx, sessionID, onChunk)
 	if err != nil {
 		return "", fmt.Errorf("stream response: %w", err)
@@ -337,10 +424,9 @@ func (c *Client) Query(ctx context.Context, chatID int64, text string, onChunk S
 		trimmed = "(no response from OpenCode)"
 	}
 
-	maxLog := 200
 	logMsg := trimmed
-	if len(logMsg) > maxLog {
-		logMsg = logMsg[:maxLog] + "…"
+	if len(logMsg) > 200 {
+		logMsg = logMsg[:200] + "…"
 	}
 	c.log.Log("RESPONSE [session=%s]: %s", sessionID, logMsg)
 
