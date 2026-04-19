@@ -18,6 +18,15 @@ import (
 	"github.com/aung-arata/opencode-telegram-bridge/internal/opencode"
 )
 
+const (
+	// telegramMaxMessageLen is the maximum text length Telegram allows in a single message.
+	telegramMaxMessageLen = 4096
+	// streamingTruncateLen is the limit for in-progress streaming edits (leaves room for suffix).
+	streamingTruncateLen = 4000
+	// minEditInterval throttles message edits to stay within Telegram's ~1 edit/second/chat rate limit.
+	minEditInterval = 1 * time.Second
+)
+
 // Bot is the Telegram polling bot.
 type Bot struct {
 	api    *tgbotapi.BotAPI
@@ -138,16 +147,14 @@ func (b *Bot) handleQuery(ctx context.Context, chatID int64, replyTo int, query 
 	defer b.mu.Unlock()
 
 	var lastEdit time.Time
-	const minEditInterval = 1 * time.Second // Telegram rate limit protection
 
 	onChunk := func(accumulated string) {
 		if time.Since(lastEdit) < minEditInterval {
 			return
 		}
-		// Truncate for Telegram's 4096 char limit
 		text := accumulated
-		if len(text) > 4000 {
-			text = text[:4000] + "\n\n... (truncated, streaming)"
+		if len(text) > streamingTruncateLen {
+			text = text[:streamingTruncateLen] + "\n\n... (truncated, streaming)"
 		}
 		edit := tgbotapi.NewEditMessageText(chatID, placeholder.MessageID, text)
 		if _, err := b.api.Send(edit); err != nil {
@@ -169,13 +176,13 @@ func (b *Bot) handleQuery(ctx context.Context, chatID int64, replyTo int, query 
 	}
 
 	// Send the final response by editing the placeholder
-	if len(response) > 4096 {
+	if len(response) > telegramMaxMessageLen {
 		// Split into multiple messages if too long
-		edit := tgbotapi.NewEditMessageText(chatID, placeholder.MessageID, response[:4096])
+		edit := tgbotapi.NewEditMessageText(chatID, placeholder.MessageID, response[:telegramMaxMessageLen])
 		b.api.Send(edit)
 		// Send remaining parts
-		for i := 4096; i < len(response); i += 4096 {
-			end := i + 4096
+		for i := telegramMaxMessageLen; i < len(response); i += telegramMaxMessageLen {
+			end := i + telegramMaxMessageLen
 			if end > len(response) {
 				end = len(response)
 			}

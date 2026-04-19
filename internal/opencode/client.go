@@ -168,7 +168,8 @@ type sseEvent struct {
 	Data  string
 }
 
-// contentDelta is the JSON structure for text content chunks.
+// contentDelta represents JSON fields that may carry text content in SSE data.
+// OpenCode may use "content", "text", or "delta" depending on the response event type.
 type contentDelta struct {
 	Content string `json:"content"`
 	Text    string `json:"text"`
@@ -178,7 +179,8 @@ type contentDelta struct {
 // readSSE reads an SSE stream and returns the accumulated response.
 func (c *Client) readSSE(r io.Reader, onChunk StreamCallback) (string, error) {
 	scanner := bufio.NewScanner(r)
-	// Increase scanner buffer for potentially large SSE data lines
+	// SSE data lines can be large (e.g. full code blocks). Use 64KB initial / 1MB max
+	// to avoid scanner buffer overflow on long assistant responses.
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 
 	var accumulated strings.Builder
