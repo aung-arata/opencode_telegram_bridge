@@ -197,12 +197,23 @@ func (e sseEvent) dataString() string {
 	return strings.Join(e.Data, "\n")
 }
 
-// contentDelta represents JSON fields that may carry text content in SSE data.
-// OpenCode may use "content", "text", or "delta" depending on the response event type.
-type contentDelta struct {
-	Content string `json:"content"`
+// contentPart represents a single entry in the OpenCode "parts" array.
+// Each part has a "type" (e.g. "text", "step-start", "step-finish") and an
+// optional "text" / "content" field carrying the actual response text.
+type contentPart struct {
+	Type    string `json:"type"`
 	Text    string `json:"text"`
-	Delta   string `json:"delta"`
+	Content string `json:"content"`
+}
+
+// contentDelta represents JSON fields that may carry text content in SSE data.
+// OpenCode may use "content", "text", "delta", or a nested "parts" array
+// depending on the response event type.
+type contentDelta struct {
+	Content string        `json:"content"`
+	Text    string        `json:"text"`
+	Delta   string        `json:"delta"`
+	Parts   []contentPart `json:"parts"`
 }
 
 // readSSE reads an SSE stream and returns the accumulated response.
@@ -271,7 +282,7 @@ func (c *Client) extractText(evt sseEvent) string {
 		return data
 	}
 
-	// Try various field names used by different APIs
+	// Try top-level field names used by different APIs
 	if delta.Content != "" {
 		return delta.Content
 	}
@@ -282,7 +293,20 @@ func (c *Client) extractText(evt sseEvent) string {
 		return delta.Delta
 	}
 
-	return ""
+	// OpenCode wraps response text inside a "parts" array.
+	// Concatenate all parts whose type is "text".
+	var sb strings.Builder
+	for _, part := range delta.Parts {
+		if part.Type != "text" {
+			continue
+		}
+		if part.Text != "" {
+			sb.WriteString(part.Text)
+		} else if part.Content != "" {
+			sb.WriteString(part.Content)
+		}
+	}
+	return sb.String()
 }
 
 // isCompletionEvent returns true if the SSE event signals the end of a response.
@@ -295,6 +319,17 @@ func isCompletionEvent(evt sseEvent) bool {
 	switch eventType {
 	case "done", "complete", "message_stop", "message-complete", "finish":
 		return true
+	}
+
+	// OpenCode signals completion via a part with type "step-finish" or "message-finish".
+	var delta contentDelta
+	if err := json.Unmarshal([]byte(evt.dataString()), &delta); err == nil {
+		for _, part := range delta.Parts {
+			t := strings.ToLower(part.Type)
+			if t == "step-finish" || t == "message-finish" || t == "finish" {
+				return true
+			}
+		}
 	}
 
 	return false
