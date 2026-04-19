@@ -42,6 +42,15 @@ func (l *Logger) Log(format string, args ...any) {
 		})
 		return
 	}
-	defer f.Close()
-	fmt.Fprintln(f, line)
+
+	if _, err := fmt.Fprintln(f, line); err != nil {
+		l.fileErrOnce.Do(func() {
+			fmt.Fprintf(os.Stderr, "WARNING: cannot write to log file %s: %v\n", l.logFile, err)
+		})
+	}
+	if err := f.Close(); err != nil {
+		l.fileErrOnce.Do(func() {
+			fmt.Fprintf(os.Stderr, "WARNING: cannot close log file %s: %v\n", l.logFile, err)
+		})
+	}
 }

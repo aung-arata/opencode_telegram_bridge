@@ -21,6 +21,11 @@ func main() {
 		os.Exit(1)
 	}
 
+	if cfg.TGUserID == 0 {
+		fmt.Fprintln(os.Stderr, "Error: TG_USER_ID is required for bridge command")
+		os.Exit(1)
+	}
+
 	log := logger.New(cfg.LogFile)
 	log.Log("OpenCode Telegram Bridge starting...")
 	log.Log("OpenCode URL: %s", cfg.OpenCodeURL)

@@ -195,27 +195,48 @@ func (b *Bot) handleQuery(ctx context.Context, chatID int64, replyTo int, query 
 	}
 }
 
-// sendReply sends a text reply to a message.
+// sendReply sends a text reply to a message, splitting into multiple messages if needed.
 func (b *Bot) sendReply(chatID int64, replyTo int, text string) *tgbotapi.Message {
-	msg := tgbotapi.NewMessage(chatID, text)
-	msg.ReplyToMessageID = replyTo
-	sent, err := b.api.Send(msg)
-	if err != nil {
-		b.log.Log("Send message error (chat=%d): %v", chatID, err)
-		return nil
+	chunks := splitRunes(text, telegramMaxMessageLen)
+	var firstSent *tgbotapi.Message
+
+	for i, chunk := range chunks {
+		msg := tgbotapi.NewMessage(chatID, chunk)
+		if i == 0 {
+			msg.ReplyToMessageID = replyTo
+		}
+
+		sent, err := b.api.Send(msg)
+		if err != nil {
+			b.log.Log("Send message error (chat=%d): %v", chatID, err)
+			if firstSent == nil {
+				return nil
+			}
+			return firstSent
+		}
+
+		if firstSent == nil {
+			firstSent = &sent
+		}
 	}
-	return &sent
+
+	return firstSent
 }
 
 // SendMessage sends a message to a chat (used by notify command).
+// Long messages are automatically split at rune boundaries.
 func SendMessage(botToken string, chatID int64, text string) error {
 	api, err := tgbotapi.NewBotAPI(botToken)
 	if err != nil {
 		return fmt.Errorf("bot init: %w", err)
 	}
-	msg := tgbotapi.NewMessage(chatID, text)
-	_, err = api.Send(msg)
-	return err
+	for _, chunk := range splitRunes(text, telegramMaxMessageLen) {
+		msg := tgbotapi.NewMessage(chatID, chunk)
+		if _, err := api.Send(msg); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // lastUpdateIDFile returns the path to the last_update_id file.
@@ -238,13 +259,29 @@ func (b *Bot) loadLastUpdateID() int64 {
 
 // saveLastUpdateID persists the last processed update ID to disk.
 func (b *Bot) saveLastUpdateID(updateID int64) {
-	tmpFile := b.lastUpdateIDFile() + ".tmp"
+	destFile := b.lastUpdateIDFile()
+	tmpFile := destFile + ".tmp"
 	if err := os.WriteFile(tmpFile, []byte(strconv.FormatInt(updateID, 10)), 0644); err != nil {
 		b.log.Log("Failed to save last update id: %v", err)
 		return
 	}
-	if err := os.Rename(tmpFile, b.lastUpdateIDFile()); err != nil {
-		b.log.Log("Failed to rename last update id file: %v", err)
+	if err := os.Rename(tmpFile, destFile); err != nil {
+		// On Windows, os.Rename fails if dest exists; remove and retry.
+		if _, statErr := os.Stat(destFile); statErr == nil {
+			if removeErr := os.Remove(destFile); removeErr != nil {
+				b.log.Log("Failed to replace last update id file: %v", err)
+				_ = os.Remove(tmpFile)
+				return
+			}
+			if retryErr := os.Rename(tmpFile, destFile); retryErr != nil {
+				b.log.Log("Failed to replace last update id file: %v", retryErr)
+				_ = os.Remove(tmpFile)
+				return
+			}
+		} else {
+			b.log.Log("Failed to rename last update id file: %v", err)
+			_ = os.Remove(tmpFile)
+		}
 	}
 }
 

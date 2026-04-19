@@ -152,7 +152,13 @@ func (c *Client) StreamResponse(ctx context.Context, sessionID string, onChunk S
 	req.Header.Set("Accept", "text/event-stream")
 	req.Header.Set("Cache-Control", "no-cache")
 
-	// Use a client without the default timeout for SSE streaming
+	// Use a dedicated client for SSE streaming — no overall Timeout on the
+	// http.Client (which would kill long-lived streams), but the context
+	// carries a deadline so a stalled stream cannot hang forever.
+	streamCtx, streamCancel := context.WithTimeout(ctx, c.sessionTimeout)
+	defer streamCancel()
+	req = req.WithContext(streamCtx)
+
 	sseClient := &http.Client{}
 	resp, err := sseClient.Do(req)
 	if err != nil {
@@ -223,8 +229,14 @@ func (c *Client) readSSE(r io.Reader, onChunk StreamCallback) (string, error) {
 		if strings.HasPrefix(line, "event:") {
 			currentEvent.Event = strings.TrimSpace(strings.TrimPrefix(line, "event:"))
 		} else if strings.HasPrefix(line, "data:") {
-			// Per SSE spec, multiple data: lines are concatenated with newlines
-			currentEvent.Data = append(currentEvent.Data, strings.TrimSpace(strings.TrimPrefix(line, "data:")))
+			// Per SSE spec, multiple data: lines are concatenated with newlines.
+			// Preserve payload whitespace; only strip the single optional space
+			// immediately following "data:" per the spec.
+			data := strings.TrimPrefix(line, "data:")
+			if strings.HasPrefix(data, " ") {
+				data = data[1:]
+			}
+			currentEvent.Data = append(currentEvent.Data, data)
 		}
 	}
 

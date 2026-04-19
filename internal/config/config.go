@@ -5,6 +5,7 @@ import (
 	"bufio"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -32,13 +33,15 @@ func Load() (*Config, error) {
 		return nil, fmt.Errorf("TG_BOT_TOKEN is required")
 	}
 
-	userIDStr := os.Getenv("TG_USER_ID")
-	if userIDStr == "" {
-		return nil, fmt.Errorf("TG_USER_ID is required")
-	}
-	userID, err := strconv.ParseInt(userIDStr, 10, 64)
-	if err != nil {
-		return nil, fmt.Errorf("TG_USER_ID must be a number: %w", err)
+	var (
+		userID int64
+		err    error
+	)
+	if userIDStr := os.Getenv("TG_USER_ID"); userIDStr != "" {
+		userID, err = strconv.ParseInt(userIDStr, 10, 64)
+		if err != nil {
+			return nil, fmt.Errorf("TG_USER_ID must be a number: %w", err)
+		}
 	}
 
 	var chatID int64
@@ -75,7 +78,7 @@ func Load() (*Config, error) {
 		OpenCodeURL:            strings.TrimRight(ocURL, "/"),
 		OpenCodeSessionTimeout: sessionTimeout,
 		RuntimeDir:             runtimeDir,
-		LogFile:                runtimeDir + "/oc_bridge.log",
+		LogFile:                filepath.Join(runtimeDir, "oc_bridge.log"),
 	}, nil
 }
 
