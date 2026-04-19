@@ -2,6 +2,7 @@
 package opencode
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -15,45 +16,49 @@ import (
 	"github.com/aung-arata/opencode-telegram-bridge/internal/logger"
 )
 
+const (
+	// sseInitialBufferSize is the starting capacity of the bufio.Scanner buffer
+	// used when reading SSE streams. Chosen to handle typical event payloads
+	// without reallocation.
+	sseInitialBufferSize = 64 * 1024 // 64 KB
+
+	// sseMaxBufferSize is the upper bound on the scanner buffer. Large LLM
+	// responses (e.g. code blocks) can produce very long data: lines.
+	sseMaxBufferSize = 1024 * 1024 // 1 MB
+
+	// sseLogSnippetLen is the maximum number of bytes logged per SSE data value.
+	sseLogSnippetLen = 120
+)
+
 // Client communicates with the OpenCode HTTP server.
 type Client struct {
 	baseURL        string
 	sessionTimeout time.Duration
-	httpClient     *http.Client
+	httpClient     *http.Client  // used for short-lived POST requests (has Timeout)
+	sseHTTPClient  *http.Client  // used for SSE GET requests (no Timeout)
 	log            *logger.Logger
 
-	ctx    context.Context
-	cancel context.CancelFunc
-
-	mu        sync.Mutex
-	listeners map[int64]*sseListener // Telegram chatID → persistent SSE listener
+	mu       sync.Mutex
+	sessions map[int64]string // Telegram chatID → OpenCode sessionID
 }
 
 // NewClient creates a new OpenCode HTTP client.
 func NewClient(baseURL string, sessionTimeout time.Duration, log *logger.Logger) *Client {
-	ctx, cancel := context.WithCancel(context.Background())
 	return &Client{
 		baseURL:        baseURL,
 		sessionTimeout: sessionTimeout,
 		httpClient:     &http.Client{Timeout: sessionTimeout},
+		sseHTTPClient:  &http.Client{}, // no timeout — stream lifetime is bounded by ctx
 		log:            log,
-		ctx:            ctx,
-		cancel:         cancel,
-		listeners:      make(map[int64]*sseListener),
+		sessions:       make(map[int64]string),
 	}
 }
 
-// Close shuts down all persistent SSE connections and releases associated resources.
-// It should be called when the application exits.
+// Close clears the cached sessions. Call on application exit.
 func (c *Client) Close() {
-	c.cancel()
 	c.mu.Lock()
-	listeners := c.listeners
-	c.listeners = make(map[int64]*sseListener)
+	c.sessions = make(map[int64]string)
 	c.mu.Unlock()
-	for _, l := range listeners {
-		l.close()
-	}
 }
 
 // createSessionResponse is the JSON returned by POST /session.
@@ -97,42 +102,26 @@ func (c *Client) CreateSession(ctx context.Context) (string, error) {
 	return result.ID, nil
 }
 
-// getOrStartListener returns (or lazily creates) the persistent SSE listener for the
-// given Telegram chat ID. On first call for a chat ID it creates an OpenCode session
-// and starts the background SSE goroutine.
-func (c *Client) getOrStartListener(ctx context.Context, chatID int64) (*sseListener, error) {
+// GetOrCreateSession returns an existing session for the chat, or creates one.
+func (c *Client) GetOrCreateSession(ctx context.Context, chatID int64) (string, error) {
 	c.mu.Lock()
-	l, ok := c.listeners[chatID]
+	sid, ok := c.sessions[chatID]
 	c.mu.Unlock()
+
 	if ok {
-		return l, nil
+		return sid, nil
 	}
 
-	sessionID, err := c.CreateSession(ctx)
+	sid, err := c.CreateSession(ctx)
 	if err != nil {
-		return nil, err
+		return "", err
 	}
 
-	// The listener uses c.ctx so it outlives any individual query context and is
-	// only stopped by Client.Close() or a server-side session-gone response.
-	l = newSSEListener(c.ctx, sessionID, c)
 	c.mu.Lock()
-	c.listeners[chatID] = l
+	c.sessions[chatID] = sid
 	c.mu.Unlock()
-	return l, nil
-}
 
-// removeListener removes l from the listener map (called by the SSE goroutine
-// when the server reports the session is gone).
-func (c *Client) removeListener(l *sseListener) {
-	c.mu.Lock()
-	for chatID, listener := range c.listeners {
-		if listener == l {
-			delete(c.listeners, chatID)
-			break
-		}
-	}
-	c.mu.Unlock()
+	return sid, nil
 }
 
 // contentPart represents a single entry in a "parts" array, used in both
@@ -156,6 +145,8 @@ func (c *Client) SendMessage(ctx context.Context, sessionID, content string) err
 	defer cancel()
 
 	url := c.baseURL + "/session/" + sessionID + "/message"
+	c.log.Log("POST message [session=%s] url=%s", sessionID, url)
+
 	body, err := json.Marshal(sendMessageRequest{
 		Parts: []contentPart{
 			{Type: "text", Content: content, Text: content},
@@ -182,6 +173,7 @@ func (c *Client) SendMessage(ctx context.Context, sessionID, content string) err
 		return fmt.Errorf("send message: HTTP %d: %s", resp.StatusCode, string(respBody))
 	}
 
+	c.log.Log("POST message [session=%s] accepted (HTTP %d)", sessionID, resp.StatusCode)
 	return nil
 }
 
@@ -275,63 +267,168 @@ func isCompletionEvent(eventName, data string, deltaOK bool, delta *contentDelta
 	return false
 }
 
-// Query sends a message to OpenCode and streams the response via the session's
-// persistent SSE connection. It handles session creation/reuse for the given
-// Telegram chat ID.
+// StreamResponse opens a per-query SSE connection to /session/{id}/events and
+// streams assistant text until the server closes the connection or a completion
+// event is received. The server closing the stream after delivering its response
+// is treated as a successful end-of-response (not an error).
+func (c *Client) StreamResponse(ctx context.Context, sessionID string, onChunk StreamCallback) (string, error) {
+	url := c.baseURL + "/session/" + sessionID + "/events"
+	c.log.Log("SSE[%s] connecting to %s", sessionID, url)
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return "", fmt.Errorf("stream request: %w", err)
+	}
+	req.Header.Set("Accept", "text/event-stream")
+	req.Header.Set("Cache-Control", "no-cache")
+
+	// Use the dedicated SSE client which has no Timeout: the stream must stay
+	// open for as long as OpenCode needs to generate the response. The caller's
+	// ctx provides the only deadline (cancelled on bot shutdown).
+	resp, err := c.sseHTTPClient.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("stream connect: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return "", fmt.Errorf("stream: HTTP %d: %s", resp.StatusCode, string(body))
+	}
+
+	c.log.Log("SSE[%s] stream connected (HTTP 200)", sessionID)
+	return c.readSSE(resp.Body, sessionID, onChunk)
+}
+
+// readSSE reads an SSE stream and returns the accumulated response text.
+//
+// Termination rules:
+//  1. A completion event is received → return immediately (success).
+//  2. The server closes the stream (EOF) → success; if content was accumulated
+//     it is returned as-is, if not the caller will show a fallback message.
+//  3. Scanner error → return whatever was collected plus the error.
+func (c *Client) readSSE(r io.Reader, sessionID string, onChunk StreamCallback) (string, error) {
+	scanner := bufio.NewScanner(r)
+	// Use the pre-defined buffer constants to handle large SSE payloads (e.g.
+	// full code blocks) without scanner buffer overflow.
+	scanner.Buffer(make([]byte, 0, sseInitialBufferSize), sseMaxBufferSize)
+
+	var accumulated strings.Builder
+	var currentEvent sseEvent
+	eventCount := 0
+
+	for scanner.Scan() {
+		line := scanner.Text()
+
+		if line == "" {
+			// Empty line = end of one SSE event.
+			if len(currentEvent.Data) > 0 {
+				eventCount++
+				data := currentEvent.dataString()
+
+				// Decode JSON once per event; share the result between extractText
+				// and isCompletionEvent to avoid redundant work.
+				var delta contentDelta
+				deltaOK := data != "" && data != "[DONE]" && json.Unmarshal([]byte(data), &delta) == nil
+
+				// Debug: log every event so timing/content issues are visible in logs.
+				c.log.Log("SSE[%s] event #%d type=%q data=%s", sessionID, eventCount,
+					currentEvent.Event, sseDataSnippet(data))
+
+				text := extractText(data, deltaOK, &delta)
+				if text != "" {
+					accumulated.WriteString(text)
+					if onChunk != nil {
+						onChunk(accumulated.String())
+					}
+				}
+
+				if isCompletionEvent(currentEvent.Event, data, deltaOK, &delta) {
+					c.log.Log("SSE[%s] completion event detected after %d events", sessionID, eventCount)
+					return accumulated.String(), nil
+				}
+			}
+			currentEvent = sseEvent{}
+			continue
+		}
+
+		if strings.HasPrefix(line, "event:") {
+			currentEvent.Event = strings.TrimSpace(strings.TrimPrefix(line, "event:"))
+		} else if strings.HasPrefix(line, "data:") {
+			// Per SSE spec: strip the single optional space immediately after "data:".
+			data := strings.TrimPrefix(line, "data:")
+			data = strings.TrimPrefix(data, " ")
+			currentEvent.Data = append(currentEvent.Data, data)
+		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		return accumulated.String(), fmt.Errorf("SSE read error: %w", err)
+	}
+
+	// Server closed the connection (EOF). This is the normal end-of-response
+	// signal for OpenCode: it closes /events once the assistant reply is complete.
+	acc := accumulated.String()
+	if acc != "" {
+		c.log.Log("SSE[%s] stream closed by server after %d events — response complete", sessionID, eventCount)
+	} else {
+		c.log.Log("SSE[%s] stream closed by server with no text content (%d events processed)", sessionID, eventCount)
+	}
+	// Return nil error regardless: EOF is a normal, successful termination.
+	return acc, nil
+}
+
+// sseDataSnippet returns a short excerpt of a raw SSE data string for logging.
+func sseDataSnippet(data string) string {
+	if len(data) <= sseLogSnippetLen {
+		return data
+	}
+	return data[:sseLogSnippetLen] + "…"
+}
+
+// Query sends a message to OpenCode and streams the response back.
+// It handles session creation/reuse for the given Telegram chat ID.
 func (c *Client) Query(ctx context.Context, chatID int64, text string, onChunk StreamCallback) (string, error) {
-	listener, err := c.getOrStartListener(ctx, chatID)
+	sessionID, err := c.GetOrCreateSession(ctx, chatID)
 	if err != nil {
 		return "", fmt.Errorf("get session: %w", err)
 	}
 
-	c.log.Log("QUERY [session=%s, chat=%d]: %s", listener.sessionID, chatID, text)
+	c.log.Log("QUERY [session=%s, chat=%d]: %s", sessionID, chatID, text)
 
-	pq := &pendingQuery{
-		onChunk:  onChunk,
-		resultCh: make(chan queryResult, 1),
-	}
-	listener.arm(pq)
-
-	if err := c.SendMessage(ctx, listener.sessionID, text); err != nil {
-		listener.disarm()
-
-		// Session might have expired; remove the stale listener and create a new one.
-		c.log.Log("SendMessage failed, recreating session: %v", err)
+	if err := c.SendMessage(ctx, sessionID, text); err != nil {
+		// Session might have expired; try creating a new one.
+		c.log.Log("SendMessage failed [session=%s], creating new session: %v", sessionID, err)
 		c.mu.Lock()
-		delete(c.listeners, chatID)
+		delete(c.sessions, chatID)
 		c.mu.Unlock()
-		listener.close()
 
-		listener, err = c.getOrStartListener(ctx, chatID)
+		sessionID, err = c.GetOrCreateSession(ctx, chatID)
 		if err != nil {
 			return "", fmt.Errorf("recreate session: %w", err)
 		}
 
-		pq = &pendingQuery{
-			onChunk:  onChunk,
-			resultCh: make(chan queryResult, 1),
-		}
-		listener.arm(pq)
-
-		if err := c.SendMessage(ctx, listener.sessionID, text); err != nil {
-			listener.disarm()
+		if err := c.SendMessage(ctx, sessionID, text); err != nil {
 			return "", fmt.Errorf("send message (retry): %w", err)
 		}
 	}
 
-	select {
-	case result := <-pq.resultCh:
-		if result.err != nil {
-			return "", fmt.Errorf("stream response: %w", result.err)
-		}
-		logMsg := result.text
-		if len(logMsg) > 200 {
-			logMsg = logMsg[:200] + "…"
-		}
-		c.log.Log("RESPONSE [session=%s]: %s", listener.sessionID, logMsg)
-		return result.text, nil
-	case <-ctx.Done():
-		listener.disarm()
-		return "", ctx.Err()
+	c.log.Log("SSE[%s] opening event stream for query", sessionID)
+	response, err := c.StreamResponse(ctx, sessionID, onChunk)
+	if err != nil {
+		return "", fmt.Errorf("stream response: %w", err)
 	}
+
+	trimmed := strings.TrimSpace(response)
+	if trimmed == "" {
+		trimmed = "(no response from OpenCode)"
+	}
+
+	logMsg := trimmed
+	if len(logMsg) > 200 {
+		logMsg = logMsg[:200] + "…"
+	}
+	c.log.Log("RESPONSE [session=%s]: %s", sessionID, logMsg)
+
+	return trimmed, nil
 }
