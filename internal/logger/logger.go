@@ -10,8 +10,9 @@ import (
 
 // Logger writes timestamped log lines to stdout and an optional file.
 type Logger struct {
-	mu      sync.Mutex
-	logFile string
+	mu          sync.Mutex
+	logFile     string
+	fileErrOnce sync.Once // ensures file-open errors are surfaced at least once
 }
 
 // New creates a new Logger that writes to the given file path.
@@ -36,6 +37,9 @@ func (l *Logger) Log(format string, args ...any) {
 
 	f, err := os.OpenFile(l.logFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
+		l.fileErrOnce.Do(func() {
+			fmt.Fprintf(os.Stderr, "WARNING: cannot open log file %s: %v\n", l.logFile, err)
+		})
 		return
 	}
 	defer f.Close()

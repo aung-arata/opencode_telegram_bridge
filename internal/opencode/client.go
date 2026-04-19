@@ -32,7 +32,7 @@ func NewClient(baseURL string, sessionTimeout time.Duration, log *logger.Logger)
 	return &Client{
 		baseURL:        baseURL,
 		sessionTimeout: sessionTimeout,
-		httpClient:     &http.Client{Timeout: 60 * time.Second},
+		httpClient:     &http.Client{Timeout: sessionTimeout},
 		log:            log,
 		sessions:       make(map[int64]string),
 	}
@@ -45,6 +45,9 @@ type createSessionResponse struct {
 
 // CreateSession creates a new OpenCode session and returns its ID.
 func (c *Client) CreateSession(ctx context.Context) (string, error) {
+	ctx, cancel := context.WithTimeout(ctx, c.sessionTimeout)
+	defer cancel()
+
 	url := c.baseURL + "/session"
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, nil)
 	if err != nil {
@@ -105,6 +108,9 @@ type sendMessageRequest struct {
 
 // SendMessage posts a message to an OpenCode session.
 func (c *Client) SendMessage(ctx context.Context, sessionID, content string) error {
+	ctx, cancel := context.WithTimeout(ctx, c.sessionTimeout)
+	defer cancel()
+
 	url := c.baseURL + "/session/" + sessionID + "/message"
 	body, err := json.Marshal(sendMessageRequest{Content: content})
 	if err != nil {
@@ -165,7 +171,12 @@ func (c *Client) StreamResponse(ctx context.Context, sessionID string, onChunk S
 // sseEvent represents a parsed Server-Sent Event.
 type sseEvent struct {
 	Event string
-	Data  string
+	Data  []string // multiple data: lines are collected per SSE spec
+}
+
+// dataString returns the event data with multiple lines joined by newlines (per SSE spec).
+func (e sseEvent) dataString() string {
+	return strings.Join(e.Data, "\n")
 }
 
 // contentDelta represents JSON fields that may carry text content in SSE data.
@@ -191,7 +202,7 @@ func (c *Client) readSSE(r io.Reader, onChunk StreamCallback) (string, error) {
 
 		if line == "" {
 			// Empty line = end of event
-			if currentEvent.Data != "" {
+			if len(currentEvent.Data) > 0 {
 				text := c.extractText(currentEvent)
 				if text != "" {
 					accumulated.WriteString(text)
@@ -212,7 +223,8 @@ func (c *Client) readSSE(r io.Reader, onChunk StreamCallback) (string, error) {
 		if strings.HasPrefix(line, "event:") {
 			currentEvent.Event = strings.TrimSpace(strings.TrimPrefix(line, "event:"))
 		} else if strings.HasPrefix(line, "data:") {
-			currentEvent.Data = strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+			// Per SSE spec, multiple data: lines are concatenated with newlines
+			currentEvent.Data = append(currentEvent.Data, strings.TrimSpace(strings.TrimPrefix(line, "data:")))
 		}
 	}
 
@@ -226,14 +238,15 @@ func (c *Client) readSSE(r io.Reader, onChunk StreamCallback) (string, error) {
 
 // extractText extracts displayable text from an SSE event.
 func (c *Client) extractText(evt sseEvent) string {
-	if evt.Data == "" || evt.Data == "[DONE]" {
+	data := evt.dataString()
+	if data == "" || data == "[DONE]" {
 		return ""
 	}
 
 	var delta contentDelta
-	if err := json.Unmarshal([]byte(evt.Data), &delta); err != nil {
-		// Not JSON, might be plain text
-		return ""
+	if err := json.Unmarshal([]byte(data), &delta); err != nil {
+		// Not JSON — return the raw data as plain text
+		return data
 	}
 
 	// Try various field names used by different APIs
@@ -252,7 +265,7 @@ func (c *Client) extractText(evt sseEvent) string {
 
 // isCompletionEvent returns true if the SSE event signals the end of a response.
 func isCompletionEvent(evt sseEvent) bool {
-	if evt.Data == "[DONE]" {
+	if evt.dataString() == "[DONE]" {
 		return true
 	}
 

@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 
@@ -19,9 +20,9 @@ import (
 )
 
 const (
-	// telegramMaxMessageLen is the maximum text length Telegram allows in a single message.
+	// telegramMaxMessageLen is the maximum character count Telegram allows in a single message.
 	telegramMaxMessageLen = 4096
-	// streamingTruncateLen is the limit for in-progress streaming edits (leaves room for suffix).
+	// streamingTruncateLen is the rune limit for in-progress streaming edits (leaves room for suffix).
 	streamingTruncateLen = 4000
 	// minEditInterval throttles message edits to stay within Telegram's ~1 edit/second/chat rate limit.
 	minEditInterval = 1 * time.Second
@@ -153,8 +154,8 @@ func (b *Bot) handleQuery(ctx context.Context, chatID int64, replyTo int, query 
 			return
 		}
 		text := accumulated
-		if len(text) > streamingTruncateLen {
-			text = text[:streamingTruncateLen] + "\n\n... (truncated, streaming)"
+		if utf8.RuneCountInString(text) > streamingTruncateLen {
+			text = truncateRunes(text, streamingTruncateLen) + "\n\n... (truncated, streaming)"
 		}
 		edit := tgbotapi.NewEditMessageText(chatID, placeholder.MessageID, text)
 		if _, err := b.api.Send(edit); err != nil {
@@ -176,17 +177,13 @@ func (b *Bot) handleQuery(ctx context.Context, chatID int64, replyTo int, query 
 	}
 
 	// Send the final response by editing the placeholder
-	if len(response) > telegramMaxMessageLen {
-		// Split into multiple messages if too long
-		edit := tgbotapi.NewEditMessageText(chatID, placeholder.MessageID, response[:telegramMaxMessageLen])
+	if utf8.RuneCountInString(response) > telegramMaxMessageLen {
+		// Split into multiple messages at rune boundaries
+		chunks := splitRunes(response, telegramMaxMessageLen)
+		edit := tgbotapi.NewEditMessageText(chatID, placeholder.MessageID, chunks[0])
 		b.api.Send(edit)
-		// Send remaining parts
-		for i := telegramMaxMessageLen; i < len(response); i += telegramMaxMessageLen {
-			end := i + telegramMaxMessageLen
-			if end > len(response) {
-				end = len(response)
-			}
-			b.sendReply(chatID, replyTo, response[i:end])
+		for _, chunk := range chunks[1:] {
+			b.sendReply(chatID, replyTo, chunk)
 		}
 	} else {
 		edit := tgbotapi.NewEditMessageText(chatID, placeholder.MessageID, response)
@@ -249,4 +246,28 @@ func (b *Bot) saveLastUpdateID(updateID int64) {
 	if err := os.Rename(tmpFile, b.lastUpdateIDFile()); err != nil {
 		b.log.Log("Failed to rename last update id file: %v", err)
 	}
+}
+
+// truncateRunes returns the first n runes of s without splitting multi-byte characters.
+func truncateRunes(s string, n int) string {
+	runes := []rune(s)
+	if len(runes) <= n {
+		return s
+	}
+	return string(runes[:n])
+}
+
+// splitRunes splits s into chunks of at most n runes each, respecting rune boundaries.
+func splitRunes(s string, n int) []string {
+	runes := []rune(s)
+	var chunks []string
+	for len(runes) > 0 {
+		end := n
+		if end > len(runes) {
+			end = len(runes)
+		}
+		chunks = append(chunks, string(runes[:end]))
+		runes = runes[end:]
+	}
+	return chunks
 }

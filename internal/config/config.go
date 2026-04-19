@@ -64,6 +64,9 @@ func Load() (*Config, error) {
 	}
 
 	runtimeDir := "runtime"
+	if err := os.MkdirAll(runtimeDir, 0755); err != nil {
+		return nil, fmt.Errorf("create runtime directory %q: %w", runtimeDir, err)
+	}
 
 	return &Config{
 		TGBotToken:             botToken,
