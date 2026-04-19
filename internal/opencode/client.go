@@ -233,9 +233,7 @@ func (c *Client) readSSE(r io.Reader, onChunk StreamCallback) (string, error) {
 			// Preserve payload whitespace; only strip the single optional space
 			// immediately following "data:" per the spec.
 			data := strings.TrimPrefix(line, "data:")
-			if strings.HasPrefix(data, " ") {
-				data = data[1:]
-			}
+			data = strings.TrimPrefix(data, " ")
 			currentEvent.Data = append(currentEvent.Data, data)
 		}
 	}

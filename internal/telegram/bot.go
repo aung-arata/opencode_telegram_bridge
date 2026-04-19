@@ -209,9 +209,6 @@ func (b *Bot) sendReply(chatID int64, replyTo int, text string) *tgbotapi.Messag
 		sent, err := b.api.Send(msg)
 		if err != nil {
 			b.log.Log("Send message error (chat=%d): %v", chatID, err)
-			if firstSent == nil {
-				return nil
-			}
 			return firstSent
 		}
 
