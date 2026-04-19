@@ -49,7 +49,7 @@ func (c *Client) CreateSession(ctx context.Context) (string, error) {
 	defer cancel()
 
 	url := c.baseURL + "/session"
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader([]byte("{}")))
 	if err != nil {
 		return "", fmt.Errorf("create session request: %w", err)
 	}
