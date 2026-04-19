@@ -101,13 +101,19 @@ func (c *Client) GetOrCreateSession(ctx context.Context, chatID int64) (string, 
 	return sid, nil
 }
 
+// contentPart represents a single entry in a "parts" array, used in both
+// outgoing message requests and incoming SSE event payloads.
+// Each part has a "type" (e.g. "text", "step-start", "step-finish") and an
+// optional "text" / "content" field carrying the actual message text.
+type contentPart struct {
+	Type    string `json:"type"`
+	Text    string `json:"text"`
+	Content string `json:"content"`
+}
+
 // sendMessageRequest is the JSON body for POST /session/{id}/message.
 type sendMessageRequest struct {
-	Parts []struct {
-		Type    string `json:"type"`
-		Content string `json:"content"`
-		Text    string `json:"text"`
-	} `json:"parts"`
+	Parts []contentPart `json:"parts"`
 }
 
 // SendMessage posts a message to an OpenCode session.
@@ -117,11 +123,7 @@ func (c *Client) SendMessage(ctx context.Context, sessionID, content string) err
 
 	url := c.baseURL + "/session/" + sessionID + "/message"
 	body, err := json.Marshal(sendMessageRequest{
-		Parts: []struct {
-			Type    string `json:"type"`
-			Content string `json:"content"`
-			Text    string `json:"text"`
-		}{
+		Parts: []contentPart{
 			{Type: "text", Content: content, Text: content},
 		},
 	})
@@ -197,15 +199,6 @@ func (e sseEvent) dataString() string {
 	return strings.Join(e.Data, "\n")
 }
 
-// contentPart represents a single entry in the OpenCode "parts" array.
-// Each part has a "type" (e.g. "text", "step-start", "step-finish") and an
-// optional "text" / "content" field carrying the actual response text.
-type contentPart struct {
-	Type    string `json:"type"`
-	Text    string `json:"text"`
-	Content string `json:"content"`
-}
-
 // contentDelta represents JSON fields that may carry text content in SSE data.
 // OpenCode may use "content", "text", "delta", or a nested "parts" array
 // depending on the response event type.
@@ -232,7 +225,14 @@ func (c *Client) readSSE(r io.Reader, onChunk StreamCallback) (string, error) {
 		if line == "" {
 			// Empty line = end of event
 			if len(currentEvent.Data) > 0 {
-				text := c.extractText(currentEvent)
+				data := currentEvent.dataString()
+
+				// Decode JSON once per event; the result is shared between text
+				// extraction and completion detection to avoid redundant work.
+				var delta contentDelta
+				deltaOK := data != "" && data != "[DONE]" && json.Unmarshal([]byte(data), &delta) == nil
+
+				text := extractText(data, deltaOK, &delta)
 				if text != "" {
 					accumulated.WriteString(text)
 					if onChunk != nil {
@@ -241,7 +241,7 @@ func (c *Client) readSSE(r io.Reader, onChunk StreamCallback) (string, error) {
 				}
 
 				// Check for completion events
-				if isCompletionEvent(currentEvent) {
+				if isCompletionEvent(currentEvent.Event, data, deltaOK, &delta) {
 					return accumulated.String(), nil
 				}
 			}
@@ -269,15 +269,15 @@ func (c *Client) readSSE(r io.Reader, onChunk StreamCallback) (string, error) {
 	return accumulated.String(), nil
 }
 
-// extractText extracts displayable text from an SSE event.
-func (c *Client) extractText(evt sseEvent) string {
-	data := evt.dataString()
+// extractText extracts displayable text from a pre-parsed SSE event payload.
+// data is the raw data string; deltaOK reports whether delta was successfully
+// unmarshaled from it.
+func extractText(data string, deltaOK bool, delta *contentDelta) string {
 	if data == "" || data == "[DONE]" {
 		return ""
 	}
 
-	var delta contentDelta
-	if err := json.Unmarshal([]byte(data), &delta); err != nil {
+	if !deltaOK {
 		// Not JSON — return the raw data as plain text
 		return data
 	}
@@ -310,20 +310,20 @@ func (c *Client) extractText(evt sseEvent) string {
 }
 
 // isCompletionEvent returns true if the SSE event signals the end of a response.
-func isCompletionEvent(evt sseEvent) bool {
-	if evt.dataString() == "[DONE]" {
+// eventName is the value of the SSE "event:" line; data is the raw payload;
+// deltaOK and delta come from a single JSON decode performed by the caller.
+func isCompletionEvent(eventName, data string, deltaOK bool, delta *contentDelta) bool {
+	if data == "[DONE]" {
 		return true
 	}
 
-	eventType := strings.ToLower(evt.Event)
-	switch eventType {
+	switch strings.ToLower(eventName) {
 	case "done", "complete", "message_stop", "message-complete", "finish":
 		return true
 	}
 
 	// OpenCode signals completion via a part with type "step-finish" or "message-finish".
-	var delta contentDelta
-	if err := json.Unmarshal([]byte(evt.dataString()), &delta); err == nil {
+	if deltaOK {
 		for _, part := range delta.Parts {
 			t := strings.ToLower(part.Type)
 			if t == "step-finish" || t == "message-finish" || t == "finish" {
