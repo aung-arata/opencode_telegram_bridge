@@ -103,7 +103,11 @@ func (c *Client) GetOrCreateSession(ctx context.Context, chatID int64) (string, 
 
 // sendMessageRequest is the JSON body for POST /session/{id}/message.
 type sendMessageRequest struct {
-	Content string `json:"content"`
+	Parts []struct {
+		Type    string `json:"type"`
+		Content string `json:"content"`
+		Text    string `json:"text"`
+	} `json:"parts"`
 }
 
 // SendMessage posts a message to an OpenCode session.
@@ -112,7 +116,15 @@ func (c *Client) SendMessage(ctx context.Context, sessionID, content string) err
 	defer cancel()
 
 	url := c.baseURL + "/session/" + sessionID + "/message"
-	body, err := json.Marshal(sendMessageRequest{Content: content})
+	body, err := json.Marshal(sendMessageRequest{
+		Parts: []struct {
+			Type    string `json:"type"`
+			Content string `json:"content"`
+			Text    string `json:"text"`
+		}{
+			{Type: "text", Content: content, Text: content},
+		},
+	})
 	if err != nil {
 		return fmt.Errorf("marshal message: %w", err)
 	}
