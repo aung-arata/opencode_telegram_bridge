@@ -1,81 +1,82 @@
 # opencode_telegram_bridge
 
-A simple Python Telegram bot script for sending notifications and proxying messages to a local [OpenCode](https://opencode.ai) process. Uses only standard library modules plus the `requests` package (no other external dependencies).
+A Go daemon that bridges Telegram with a local [OpenCode](https://opencode.ai) server. Polls Telegram for messages, forwards them to OpenCode via its HTTP+SSE API, and streams responses back as edited Telegram messages (typing effect).
 
 ---
 
-## Scripts
-
-### `send_telegram.py` — one-shot notification sender
+## Architecture
 
 ```
-python3 send_telegram.py "Your message text here"
+cmd/
+  bridge/main.go       — entry point, wires everything together
+  notify/main.go       — one-shot CLI tool to send a Telegram message
+internal/
+  config/config.go     — .env loader, config struct
+  opencode/client.go   — HTTP client: CreateSession, SendMessage, StreamResponse (SSE)
+  telegram/bot.go      — polling loop, command dispatch, send/reply helpers
+  logger/logger.go     — UTC timestamped file + stdout logger
+```
+
+---
+
+## Prerequisites
+
+- **Go 1.21+** to build from source
+- **OpenCode** running as a local HTTP server:
+  ```
+  opencode serve
+  ```
+  By default OpenCode listens on `http://127.0.0.1:4096`.
+
+---
+
+## Build
+
+```bash
+go build -o bridge ./cmd/bridge/
+go build -o notify ./cmd/notify/
+```
+
+---
+
+## Usage
+
+### `bridge` — interactive bot + OpenCode proxy
+
+```bash
+./bridge
+```
+
+Polls Telegram for messages from **you** (identified by `TG_USER_ID`), forwards them to OpenCode via its HTTP API, and streams the response back.
+
+**How it works:**
+
+1. Any plain-text message you send to the bot (not starting with `/`) is forwarded to OpenCode as a query.
+2. The bot creates an OpenCode session per Telegram chat (persistent conversation thread).
+3. Responses are streamed back in real time by editing the placeholder message (typing effect).
+4. Queries are serialized so concurrent messages are handled one at a time.
+5. All activity is logged with UTC timestamps to `runtime/oc_bridge.log`.
+
+### `notify` — one-shot message sender
+
+```bash
+./notify "Your message text here"
 ```
 
 Sends a single message to the chat configured by `TG_CHAT_ID`. Useful for automation / container notifications.
 
 ---
 
-### `polling_bot.py` — interactive bot + OpenCode proxy
-
-Polls Telegram for messages from **you** (identified by `TG_USER_ID`) and forwards them to OpenCode — either via a **persistent Unix socket session** or by **spawning a subprocess**.
-
-```
-python3 polling_bot.py
-```
-
-**How it works:**
-
-1. Any plain-text message you send to the bot (not starting with `/`) is forwarded to OpenCode as a query.
-2. The bot waits for OpenCode to respond (up to `OPENCODE_RESPONSE_TIMEOUT` seconds, cutting off after `OPENCODE_IDLE_TIMEOUT` seconds of silence).
-3. The response is sent back to you as a reply in Telegram.
-4. Requests are serialized (queued), so concurrent messages are handled one at a time.
-5. All queries, responses, and session activity are logged with UTC timestamps to `runtime/oc_bridge.log`.
-
----
-
-#### Proxy modes
-
-| Mode | How to activate | Description |
-|---|---|---|
-| **Subprocess** (default) | No session active | Bot spawns (or reuses) a local `opencode` process, communicates via stdin/stdout |
-| **Session (Unix socket)** | `/session <path>` | Bot connects to a persistent, already-running OpenCode process via a Unix domain socket at `<path>`; stateful session is preserved across queries |
-
----
-
-#### Bot commands
+## Bot commands
 
 | Command | Description |
 |---|---|
-| `<any plain text>` | Forward as query to OpenCode (active mode) |
-| `/ask <query>` | Explicit OpenCode query (active mode) |
-| `/session <path>` | Switch to persistent-session mode; `<path>` is the Unix socket OpenCode listens on (e.g. `/tmp/opencode.sock`) |
-| `/session end` | Revert to subprocess-per-query mode |
-| `/session status` | Show current session setting |
+| `<any plain text>` | Forward as query to OpenCode |
+| `/ask <query>` | Explicit OpenCode query |
 | `/echo <msg>` | Bot replies with the same text |
-| `/help` | Show command reference and current status |
+| `/help` | Show command reference and status |
 
-**Only `TG_USER_ID` can trigger queries or change session settings; all other senders are silently ignored.**
-
----
-
-#### Session mode — quick start
-
-1. Start OpenCode with IPC socket support (example; exact flag depends on OpenCode version):
-   ```
-   opencode --ipc /tmp/opencode.sock
-   ```
-2. In Telegram, tell the bot to use that socket:
-   ```
-   /session /tmp/opencode.sock
-   ```
-3. Send any message — it is forwarded to the running OpenCode process and the reply comes back immediately (no process startup overhead, session state preserved).
-4. To stop using the session:
-   ```
-   /session end
-   ```
-
-**IPC protocol** (for custom OpenCode wrappers): line-oriented plain text over a Unix domain socket — the bot sends `<query>\n` and reads lines back until `OPENCODE_IDLE_TIMEOUT` seconds of silence or the `OPENCODE_RESPONSE_TIMEOUT` hard cap.
+**Only `TG_USER_ID` can trigger queries; all other senders are silently ignored.**
 
 ---
 
@@ -88,20 +89,38 @@ TG_BOT_TOKEN=123456:abcdeFghijKLMNOPqrs_tuvwxYZ
 TG_USER_ID=123456789
 TG_CHAT_ID=123456789
 
-# Optional — OpenCode proxy tuning
-OPENCODE_CMD=opencode          # command used to launch OpenCode in subprocess mode (default: opencode)
-OPENCODE_IDLE_TIMEOUT=2.0      # seconds of stdout/socket silence = response complete (default: 2.0)
-OPENCODE_RESPONSE_TIMEOUT=30   # hard cap in seconds before giving up (default: 30)
+# OpenCode server URL (default: http://127.0.0.1:4096)
+OPENCODE_URL=http://127.0.0.1:4096
+
+# Session timeout for HTTP requests (default: 30s)
+OPENCODE_SESSION_TIMEOUT=30s
 ```
 
 | Variable | Required by | Purpose |
 |---|---|---|
-| `TG_BOT_TOKEN` | both scripts | Telegram bot token |
-| `TG_USER_ID` | `polling_bot.py` | Your Telegram numeric user ID |
-| `TG_CHAT_ID` | `send_telegram.py` | Target chat for notifications |
-| `OPENCODE_CMD` | `polling_bot.py` | Shell command to launch OpenCode (subprocess mode) |
-| `OPENCODE_IDLE_TIMEOUT` | `polling_bot.py` | Idle cutoff for response detection (both modes) |
-| `OPENCODE_RESPONSE_TIMEOUT` | `polling_bot.py` | Hard deadline per query (both modes) |
+| `TG_BOT_TOKEN` | both binaries | Telegram bot token |
+| `TG_USER_ID` | `bridge` | Your Telegram numeric user ID |
+| `TG_CHAT_ID` | `notify` | Target chat for notifications |
+| `OPENCODE_URL` | `bridge` | OpenCode HTTP server base URL |
+| `OPENCODE_SESSION_TIMEOUT` | `bridge` | Timeout for OpenCode HTTP requests |
+
+---
+
+## OpenCode HTTP API
+
+The bridge communicates with OpenCode via its HTTP server:
+
+1. **`POST /session`** — create a new session, returns `{ "id": "..." }`
+2. **`POST /session/{sessionId}/message`** — send a message/prompt to a session
+3. **`GET /session/{sessionId}/events`** — SSE stream of response chunks
+
+Start OpenCode in server mode before running the bridge:
+
+```bash
+opencode serve
+# Default: http://127.0.0.1:4096
+# Verify: curl http://127.0.0.1:4096/openapi.json
+```
 
 ---
 
@@ -116,17 +135,15 @@ All runtime state is kept in the `runtime/` directory (git-ignored, safe to dele
 
 ---
 
-## Error handling
+## Graceful shutdown
 
-- If OpenCode is not installed or the command fails, the bot replies with a descriptive error message instead of crashing.
-- If the OpenCode process exits mid-conversation, the bot attempts to restart it on the next query.
-- In session mode, if the Unix socket cannot be reached (missing, connection refused, timeout), the bot reports a clear error and reminds you to use `/session end` to fall back.
+The bridge handles `SIGINT` and `SIGTERM` for clean shutdown — stop polling, drain in-flight requests, and exit.
 
 ---
 
 ## License
+
 MIT
 
 ---
 Co-authored-by: aung-arata <5259204+aung-arata@users.noreply.github.com>
-Co-authored-by: oc-ghcp-gpt41 <oc-ghcp-gpt41@users.noreply.github.com>
