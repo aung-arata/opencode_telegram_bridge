@@ -358,20 +358,23 @@ func (c *Client) readSSE(r io.Reader, sessionID string, onChunk StreamCallback) 
 				// Try to parse as a /global/event envelope first.
 				var ge globalEvent
 				if json.Unmarshal([]byte(data), &ge) == nil && ge.Payload.Type != "" {
-					c.log.Log("SSE[%s] event #%d type=%q data=%s", sessionID, eventCount,
-						ge.Payload.Type, sseDataSnippet(data))
-
 					// Extract the sessionID from the event properties (present on
 					// most session.* and message.* events). Skip events that belong
-					// to a different session. Unmarshal errors are intentionally
-					// ignored: events like server.connected/server.heartbeat carry no
-					// sessionID and props.SessionID will simply be "".
+					// to a different session before logging any payload snippet.
+					// Unmarshal errors are intentionally ignored: events like
+					// server.connected/server.heartbeat carry no sessionID and
+					// props.SessionID will simply be "".
 					var props sessionEventProperties
 					_ = json.Unmarshal(ge.Payload.Properties, &props)
 					if props.SessionID != "" && props.SessionID != sessionID {
+						c.log.Log("SSE[%s] event #%d type=%q skipped for session=%q", sessionID, eventCount,
+							ge.Payload.Type, props.SessionID)
 						currentEvent = sseEvent{}
 						continue
 					}
+
+					c.log.Log("SSE[%s] event #%d type=%q data=%s", sessionID, eventCount,
+						ge.Payload.Type, sseDataSnippet(data))
 
 					// Extract streaming text from message.part.delta events.
 					if ge.Payload.Type == "message.part.delta" {
