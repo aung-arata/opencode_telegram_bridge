@@ -201,6 +201,31 @@ type contentDelta struct {
 	Parts   []contentPart `json:"parts"`
 }
 
+// globalEvent is the top-level wrapper for every event on the /global/event SSE stream.
+type globalEvent struct {
+	Payload globalPayload `json:"payload"`
+}
+
+// globalPayload holds the discriminated event type and its raw properties.
+type globalPayload struct {
+	Type       string          `json:"type"`
+	Properties json.RawMessage `json:"properties"`
+}
+
+// partDeltaProperties holds the fields of a "message.part.delta" event.
+// These events carry individual text chunks while the assistant is streaming.
+type partDeltaProperties struct {
+	SessionID string `json:"sessionID"`
+	Field     string `json:"field"`
+	Delta     string `json:"delta"`
+}
+
+// sessionEventProperties holds the sessionID present in most session.* and
+// message.* global events.
+type sessionEventProperties struct {
+	SessionID string `json:"sessionID"`
+}
+
 // extractText extracts displayable text from a pre-parsed SSE event payload.
 // data is the raw data string; deltaOK reports whether delta was successfully
 // unmarshaled from it.
@@ -250,7 +275,7 @@ func isCompletionEvent(eventName, data string, deltaOK bool, delta *contentDelta
 	}
 
 	switch strings.ToLower(eventName) {
-	case "done", "complete", "message_stop", "message-complete", "finish":
+	case "done", "complete", "message_stop", "message-complete", "finish", "session.idle":
 		return true
 	}
 
@@ -267,12 +292,11 @@ func isCompletionEvent(eventName, data string, deltaOK bool, delta *contentDelta
 	return false
 }
 
-// StreamResponse opens a per-query SSE connection to /session/{id}/events and
-// streams assistant text until the server closes the connection or a completion
-// event is received. The server closing the stream after delivering its response
-// is treated as a successful end-of-response (not an error).
+// StreamResponse opens a connection to the global SSE event stream at
+// /global/event and streams assistant text for the given session until the
+// server signals completion (session.idle) or closes the connection.
 func (c *Client) StreamResponse(ctx context.Context, sessionID string, onChunk StreamCallback) (string, error) {
-	url := c.baseURL + "/session/" + sessionID + "/events"
+	url := c.baseURL + "/global/event"
 	c.log.Log("SSE[%s] connecting to %s", sessionID, url)
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
@@ -302,6 +326,11 @@ func (c *Client) StreamResponse(ctx context.Context, sessionID string, onChunk S
 
 // readSSE reads an SSE stream and returns the accumulated response text.
 //
+// For the /global/event stream, each data payload is a JSON-encoded globalEvent.
+// Events for other sessions are silently skipped. Text is accumulated from
+// "message.part.delta" events (field=="text"), and completion is signalled by
+// a "session.idle" event for the current session.
+//
 // Termination rules:
 //  1. A completion event is received → return immediately (success).
 //  2. The server closes the stream (EOF) → success; if content was accumulated
@@ -326,12 +355,55 @@ func (c *Client) readSSE(r io.Reader, sessionID string, onChunk StreamCallback) 
 				eventCount++
 				data := currentEvent.dataString()
 
+				// Try to parse as a /global/event envelope first.
+				var ge globalEvent
+				if json.Unmarshal([]byte(data), &ge) == nil && ge.Payload.Type != "" {
+					// Extract the sessionID from the event properties (present on
+					// most session.* and message.* events). Skip events that belong
+					// to a different session before logging any payload snippet.
+					// Unmarshal errors are intentionally ignored: events like
+					// server.connected/server.heartbeat carry no sessionID and
+					// props.SessionID will simply be "".
+					var props sessionEventProperties
+					_ = json.Unmarshal(ge.Payload.Properties, &props)
+					if props.SessionID != "" && props.SessionID != sessionID {
+						c.log.Log("SSE[%s] event #%d type=%q skipped for session=%q", sessionID, eventCount,
+							ge.Payload.Type, props.SessionID)
+						currentEvent = sseEvent{}
+						continue
+					}
+
+					c.log.Log("SSE[%s] event #%d type=%q data=%s", sessionID, eventCount,
+						ge.Payload.Type, sseDataSnippet(data))
+
+					// Extract streaming text from message.part.delta events.
+					if ge.Payload.Type == "message.part.delta" {
+						var delta partDeltaProperties
+						deltaErr := json.Unmarshal(ge.Payload.Properties, &delta)
+						if deltaErr == nil && delta.Field == "text" && delta.Delta != "" {
+							accumulated.WriteString(delta.Delta)
+							if onChunk != nil {
+								onChunk(accumulated.String())
+							}
+						}
+					}
+
+					// session.idle signals that the assistant has finished responding.
+					if ge.Payload.Type == "session.idle" {
+						c.log.Log("SSE[%s] completion event detected after %d events", sessionID, eventCount)
+						return accumulated.String(), nil
+					}
+
+					currentEvent = sseEvent{}
+					continue
+				}
+
+				// Fallback: handle non-global-format events using the legacy logic.
 				// Decode JSON once per event; share the result between extractText
 				// and isCompletionEvent to avoid redundant work.
 				var delta contentDelta
 				deltaOK := data != "" && data != "[DONE]" && json.Unmarshal([]byte(data), &delta) == nil
 
-				// Debug: log every event so timing/content issues are visible in logs.
 				c.log.Log("SSE[%s] event #%d type=%q data=%s", sessionID, eventCount,
 					currentEvent.Event, sseDataSnippet(data))
 
