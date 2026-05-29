@@ -34,8 +34,8 @@ const (
 type Client struct {
 	baseURL        string
 	sessionTimeout time.Duration
-	httpClient     *http.Client  // used for short-lived POST requests (has Timeout)
-	sseHTTPClient  *http.Client  // used for SSE GET requests (no Timeout)
+	httpClient     *http.Client // used for short-lived POST requests (has Timeout)
+	sseHTTPClient  *http.Client // used for SSE GET requests (no Timeout)
 	log            *logger.Logger
 
 	mu       sync.Mutex
@@ -292,16 +292,17 @@ func isCompletionEvent(eventName, data string, deltaOK bool, delta *contentDelta
 	return false
 }
 
-// StreamResponse opens a connection to the global SSE event stream at
-// /global/event and streams assistant text for the given session until the
-// server signals completion (session.idle) or closes the connection.
-func (c *Client) StreamResponse(ctx context.Context, sessionID string, onChunk StreamCallback) (string, error) {
+// openSSEConn opens an SSE HTTP connection to the global event stream at
+// /global/event and returns the HTTP response. /global/event is a persistent
+// stream that stays open; events are filtered by sessionID in readSSE.
+// The caller must close resp.Body when done.
+func (c *Client) openSSEConn(ctx context.Context, sessionID string) (*http.Response, error) {
 	url := c.baseURL + "/global/event"
 	c.log.Log("SSE[%s] connecting to %s", sessionID, url)
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
-		return "", fmt.Errorf("stream request: %w", err)
+		return nil, fmt.Errorf("SSE request: %w", err)
 	}
 	req.Header.Set("Accept", "text/event-stream")
 	req.Header.Set("Cache-Control", "no-cache")
@@ -311,16 +312,28 @@ func (c *Client) StreamResponse(ctx context.Context, sessionID string, onChunk S
 	// ctx provides the only deadline (cancelled on bot shutdown).
 	resp, err := c.sseHTTPClient.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("stream connect: %w", err)
+		return nil, fmt.Errorf("SSE connect: %w", err)
 	}
-	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
-		return "", fmt.Errorf("stream: HTTP %d: %s", resp.StatusCode, string(body))
+		resp.Body.Close()
+		return nil, fmt.Errorf("SSE: HTTP %d: %s", resp.StatusCode, string(body))
 	}
 
 	c.log.Log("SSE[%s] stream connected (HTTP 200)", sessionID)
+	return resp, nil
+}
+
+// StreamResponse opens a connection to the global SSE event stream at
+// /global/event and streams assistant text for the given session until the
+// server signals completion (session.idle) or closes the connection.
+func (c *Client) StreamResponse(ctx context.Context, sessionID string, onChunk StreamCallback) (string, error) {
+	resp, err := c.openSSEConn(ctx, sessionID)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
 	return c.readSSE(resp.Body, sessionID, onChunk)
 }
 
@@ -468,9 +481,34 @@ func (c *Client) Query(ctx context.Context, chatID int64, text string, onChunk S
 
 	c.log.Log("QUERY [session=%s, chat=%d]: %s", sessionID, chatID, text)
 
+	type sseResult struct {
+		text string
+		err  error
+	}
+
+	// Open the SSE stream BEFORE sending the message to avoid the race where
+	// OpenCode emits all response events before we start listening.
+	sseCtx, sseCancel := context.WithCancel(ctx)
+	defer func() { sseCancel() }()
+
+	sseResp, err := c.openSSEConn(sseCtx, sessionID)
+	if err != nil {
+		return "", fmt.Errorf("SSE connect: %w", err)
+	}
+
+	resultCh := make(chan sseResult, 1)
+	go func() {
+		defer sseResp.Body.Close()
+		t, e := c.readSSE(sseResp.Body, sessionID, onChunk)
+		resultCh <- sseResult{t, e}
+	}()
+
 	if err := c.SendMessage(ctx, sessionID, text); err != nil {
-		// Session might have expired; try creating a new one.
+		// Session might have expired; cancel SSE, recreate session, and retry.
 		c.log.Log("SendMessage failed [session=%s], creating new session: %v", sessionID, err)
+		sseCancel()
+		<-resultCh // drain goroutine before creating new session
+
 		c.mu.Lock()
 		delete(c.sessions, chatID)
 		c.mu.Unlock()
@@ -480,18 +518,33 @@ func (c *Client) Query(ctx context.Context, chatID int64, text string, onChunk S
 			return "", fmt.Errorf("recreate session: %w", err)
 		}
 
+		// Open fresh SSE for the new session; reassign sseCancel so defer cleans up.
+		var sseCtx2 context.Context
+		sseCtx2, sseCancel = context.WithCancel(ctx)
+		sseResp2, err := c.openSSEConn(sseCtx2, sessionID)
+		if err != nil {
+			return "", fmt.Errorf("SSE reconnect: %w", err)
+		}
+
+		resultCh = make(chan sseResult, 1)
+		go func() {
+			defer sseResp2.Body.Close()
+			t, e := c.readSSE(sseResp2.Body, sessionID, onChunk)
+			resultCh <- sseResult{t, e}
+		}()
+
 		if err := c.SendMessage(ctx, sessionID, text); err != nil {
 			return "", fmt.Errorf("send message (retry): %w", err)
 		}
 	}
 
-	c.log.Log("SSE[%s] opening event stream for query", sessionID)
-	response, err := c.StreamResponse(ctx, sessionID, onChunk)
-	if err != nil {
-		return "", fmt.Errorf("stream response: %w", err)
+	c.log.Log("SSE[%s] waiting for response...", sessionID)
+	res := <-resultCh
+	if res.err != nil {
+		return "", fmt.Errorf("stream response: %w", res.err)
 	}
 
-	trimmed := strings.TrimSpace(response)
+	trimmed := strings.TrimSpace(res.text)
 	if trimmed == "" {
 		trimmed = "(no response from OpenCode)"
 	}
