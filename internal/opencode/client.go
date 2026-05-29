@@ -102,6 +102,13 @@ func (c *Client) CreateSession(ctx context.Context) (string, error) {
 	return result.ID, nil
 }
 
+// ResetSession drops the cached session for a chat so the next query creates a fresh one.
+func (c *Client) ResetSession(chatID int64) {
+	c.mu.Lock()
+	delete(c.sessions, chatID)
+	c.mu.Unlock()
+}
+
 // GetOrCreateSession returns an existing session for the chat, or creates one.
 func (c *Client) GetOrCreateSession(ctx context.Context, chatID int64) (string, error) {
 	c.mu.Lock()

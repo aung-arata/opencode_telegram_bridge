@@ -110,6 +110,8 @@ func (b *Bot) handleMessage(ctx context.Context, msg *tgbotapi.Message) {
 		b.cmdHelp(chatID, msgID)
 	case text == "/start":
 		b.cmdHelp(chatID, msgID)
+	case text == "/newsession":
+		b.cmdNewSession(chatID, msgID)
 	case strings.HasPrefix(text, "/echo "):
 		b.sendReply(chatID, msgID, strings.TrimPrefix(text, "/echo "))
 	case strings.HasPrefix(text, "/ask "):
@@ -127,13 +129,21 @@ func (b *Bot) cmdHelp(chatID int64, replyTo int) {
 	help := "🤖 OpenCode Telegram Bridge\n\n" +
 		"Send any plain message → forwarded to OpenCode as a query.\n\n" +
 		"Commands:\n" +
-		"/ask <query> — explicit OpenCode query\n" +
-		"/echo <msg>  — bot replies with your message\n" +
-		"/help        — show this help\n\n" +
+		"/ask <query>  — explicit OpenCode query\n" +
+		"/newsession   — start a fresh OpenCode session\n" +
+		"/echo <msg>   — bot replies with your message\n" +
+		"/help         — show this help\n\n" +
 		fmt.Sprintf("OpenCode URL: %s\n", b.cfg.OpenCodeURL) +
 		fmt.Sprintf("Session timeout: %s\n", b.cfg.OpenCodeSessionTimeout) +
 		fmt.Sprintf("Log: %s", b.cfg.LogFile)
 	b.sendReply(chatID, replyTo, help)
+}
+
+// cmdNewSession drops the current OpenCode session so the next query starts fresh.
+func (b *Bot) cmdNewSession(chatID int64, replyTo int) {
+	b.oc.ResetSession(chatID)
+	b.log.Log("Session reset for chat=%d", chatID)
+	b.sendReply(chatID, replyTo, "\U0001F195 New session started. Next message will create a fresh OpenCode session.")
 }
 
 // handleQuery sends a query to OpenCode and streams the response back.
