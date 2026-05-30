@@ -140,10 +140,14 @@ func (b *Bot) cmdHelp(chatID int64, replyTo int) {
 }
 
 // cmdNewSession drops the current OpenCode session so the next query starts fresh.
+// It acquires b.mu so that any in-progress query finishes before the session is
+// cleared, preventing two concurrent sessions for the same chat.
 func (b *Bot) cmdNewSession(chatID int64, replyTo int) {
+	b.mu.Lock()
 	b.oc.ResetSession(chatID)
+	b.mu.Unlock()
 	b.log.Log("Session reset for chat=%d", chatID)
-	b.sendReply(chatID, replyTo, "\U0001F195 New session started. Next message will create a fresh OpenCode session.")
+	b.sendReply(chatID, replyTo, "\U0001F195 Session context cleared. Your next message will start a fresh OpenCode session.")
 }
 
 // handleQuery sends a query to OpenCode and streams the response back.
