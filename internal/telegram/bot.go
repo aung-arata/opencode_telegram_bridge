@@ -30,11 +30,11 @@ const (
 
 // Bot is the Telegram polling bot.
 type Bot struct {
-	api    *tgbotapi.BotAPI
-	cfg    *config.Config
-	log    *logger.Logger
-	oc     *opencode.Client
-	mu     sync.Mutex // serializes OpenCode queries
+	api *tgbotapi.BotAPI
+	cfg *config.Config
+	log *logger.Logger
+	oc  *opencode.Client
+	mu  sync.Mutex // serializes OpenCode queries
 }
 
 // NewBot creates a new Telegram bot instance.
