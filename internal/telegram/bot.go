@@ -30,11 +30,11 @@ const (
 
 // Bot is the Telegram polling bot.
 type Bot struct {
-	api    *tgbotapi.BotAPI
-	cfg    *config.Config
-	log    *logger.Logger
-	oc     *opencode.Client
-	mu     sync.Mutex // serializes OpenCode queries
+	api *tgbotapi.BotAPI
+	cfg *config.Config
+	log *logger.Logger
+	oc  *opencode.Client
+	mu  sync.Mutex // serializes OpenCode queries
 }
 
 // NewBot creates a new Telegram bot instance.
@@ -110,6 +110,8 @@ func (b *Bot) handleMessage(ctx context.Context, msg *tgbotapi.Message) {
 		b.cmdHelp(chatID, msgID)
 	case text == "/start":
 		b.cmdHelp(chatID, msgID)
+	case text == "/newsession":
+		b.cmdNewSession(chatID, msgID)
 	case strings.HasPrefix(text, "/echo "):
 		b.sendReply(chatID, msgID, strings.TrimPrefix(text, "/echo "))
 	case strings.HasPrefix(text, "/ask "):
@@ -127,13 +129,25 @@ func (b *Bot) cmdHelp(chatID int64, replyTo int) {
 	help := "🤖 OpenCode Telegram Bridge\n\n" +
 		"Send any plain message → forwarded to OpenCode as a query.\n\n" +
 		"Commands:\n" +
-		"/ask <query> — explicit OpenCode query\n" +
-		"/echo <msg>  — bot replies with your message\n" +
-		"/help        — show this help\n\n" +
+		"/ask <query>  — explicit OpenCode query\n" +
+		"/newsession   — start a fresh OpenCode session\n" +
+		"/echo <msg>   — bot replies with your message\n" +
+		"/help         — show this help\n\n" +
 		fmt.Sprintf("OpenCode URL: %s\n", b.cfg.OpenCodeURL) +
 		fmt.Sprintf("Session timeout: %s\n", b.cfg.OpenCodeSessionTimeout) +
 		fmt.Sprintf("Log: %s", b.cfg.LogFile)
 	b.sendReply(chatID, replyTo, help)
+}
+
+// cmdNewSession drops the current OpenCode session so the next query starts fresh.
+// It acquires b.mu so that any in-progress query finishes before the session is
+// cleared, preventing two concurrent sessions for the same chat.
+func (b *Bot) cmdNewSession(chatID int64, replyTo int) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.oc.ResetSession(chatID)
+	b.log.Log("Session reset for chat=%d", chatID)
+	b.sendReply(chatID, replyTo, "\U0001F195 Session context cleared. Your next message will start a fresh OpenCode session.")
 }
 
 // handleQuery sends a query to OpenCode and streams the response back.
