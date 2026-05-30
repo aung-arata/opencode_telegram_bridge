@@ -144,8 +144,8 @@ func (b *Bot) cmdHelp(chatID int64, replyTo int) {
 // cleared, preventing two concurrent sessions for the same chat.
 func (b *Bot) cmdNewSession(chatID int64, replyTo int) {
 	b.mu.Lock()
+	defer b.mu.Unlock()
 	b.oc.ResetSession(chatID)
-	b.mu.Unlock()
 	b.log.Log("Session reset for chat=%d", chatID)
 	b.sendReply(chatID, replyTo, "\U0001F195 Session context cleared. Your next message will start a fresh OpenCode session.")
 }
