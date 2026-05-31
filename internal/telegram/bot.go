@@ -26,7 +26,16 @@ const (
 	streamingTruncateLen = 4000
 	// minEditInterval throttles message edits to stay within Telegram's ~1 edit/second/chat rate limit.
 	minEditInterval = 1 * time.Second
+	// permCallbackPrefix is the prefix for inline keyboard callback data for permissions.
+	permCallbackPrefix = "perm:"
 )
+
+// pendingPerm tracks a permission request that is waiting for user approval.
+type pendingPerm struct {
+	chatID    int64
+	msgID     int
+	sessionID string
+}
 
 // Bot is the Telegram polling bot.
 type Bot struct {
@@ -35,6 +44,9 @@ type Bot struct {
 	log *logger.Logger
 	oc  *opencode.Client
 	mu  sync.Mutex // serializes OpenCode queries
+
+	permMu       sync.Mutex
+	pendingPerms map[string]pendingPerm // permissionID → pendingPerm
 }
 
 // NewBot creates a new Telegram bot instance.
@@ -47,10 +59,11 @@ func NewBot(cfg *config.Config, log *logger.Logger, oc *opencode.Client) (*Bot, 
 	log.Log("Telegram bot authorized as @%s", api.Self.UserName)
 
 	return &Bot{
-		api: api,
-		cfg: cfg,
-		log: log,
-		oc:  oc,
+		api:          api,
+		cfg:          cfg,
+		log:          log,
+		oc:           oc,
+		pendingPerms: make(map[string]pendingPerm),
 	}, nil
 }
 
@@ -74,12 +87,14 @@ func (b *Bot) Run(ctx context.Context) {
 			if !ok {
 				return
 			}
-			if update.Message == nil {
-				b.saveLastUpdateID(int64(update.UpdateID))
-				continue
+			switch {
+			case update.Message != nil:
+				go func(msg *tgbotapi.Message) {
+					b.handleMessage(ctx, msg)
+				}(update.Message)
+			case update.CallbackQuery != nil:
+				b.handleCallbackQuery(ctx, update.CallbackQuery)
 			}
-
-			b.handleMessage(ctx, update.Message)
 			b.saveLastUpdateID(int64(update.UpdateID))
 		}
 	}
@@ -181,7 +196,9 @@ func (b *Bot) handleQuery(ctx context.Context, chatID int64, replyTo int, query 
 		lastEdit = time.Now()
 	}
 
-	response, err := b.oc.Query(ctx, chatID, query, onChunk)
+	response, err := b.oc.Query(ctx, chatID, query, onChunk, func(req opencode.PermissionRequest) {
+		b.handlePermissionRequest(chatID, req)
+	})
 	if err != nil {
 		b.log.Log("OpenCode query error: %v", err)
 		errMsg := fmt.Sprintf("❌ OpenCode error: %v", err)
@@ -207,6 +224,105 @@ func (b *Bot) handleQuery(ctx context.Context, chatID int64, replyTo int, query 
 			}
 		}
 	}
+}
+
+// handlePermissionRequest sends a Telegram message with an inline keyboard
+// asking the user to approve or reject an OpenCode permission request.
+func (b *Bot) handlePermissionRequest(chatID int64, req opencode.PermissionRequest) {
+	patterns := strings.Join(req.Patterns, ", ")
+	if patterns == "" {
+		patterns = "(any)"
+	}
+	text := fmt.Sprintf(
+		"🔐 OpenCode needs permission\n\n"+
+			"Tool: %s\n"+
+			"Patterns: %s",
+		req.Permission, patterns,
+	)
+
+	keyboard := tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("✅ Once", permCallbackPrefix+req.ID+":once"),
+			tgbotapi.NewInlineKeyboardButtonData("♾ Always", permCallbackPrefix+req.ID+":always"),
+			tgbotapi.NewInlineKeyboardButtonData("❌ Reject", permCallbackPrefix+req.ID+":reject"),
+		),
+	)
+
+	msg := tgbotapi.NewMessage(chatID, text)
+	msg.ReplyMarkup = keyboard
+	sent, err := b.api.Send(msg)
+	if err != nil {
+		b.log.Log("Failed to send permission request message: %v", err)
+		return
+	}
+
+	b.permMu.Lock()
+	b.pendingPerms[req.ID] = pendingPerm{
+		chatID:    chatID,
+		msgID:     sent.MessageID,
+		sessionID: req.SessionID,
+	}
+	b.permMu.Unlock()
+}
+
+// handleCallbackQuery processes an inline keyboard button press.
+func (b *Bot) handleCallbackQuery(ctx context.Context, cq *tgbotapi.CallbackQuery) {
+	// Always acknowledge the callback to clear Telegram's loading spinner.
+	defer func() {
+		answer := tgbotapi.NewCallback(cq.ID, "")
+		b.api.Request(answer) //nolint:errcheck
+	}()
+
+	data := cq.Data
+	if !strings.HasPrefix(data, permCallbackPrefix) {
+		return
+	}
+	data = strings.TrimPrefix(data, permCallbackPrefix)
+	// data is now "<permissionID>:<reply>"
+	lastColon := strings.LastIndex(data, ":")
+	if lastColon < 0 {
+		return
+	}
+	permID := data[:lastColon]
+	reply := data[lastColon+1:]
+
+	if reply != "once" && reply != "always" && reply != "reject" {
+		return
+	}
+
+	b.permMu.Lock()
+	perm, ok := b.pendingPerms[permID]
+	if ok {
+		delete(b.pendingPerms, permID)
+	}
+	b.permMu.Unlock()
+
+	if !ok {
+		b.log.Log("Received callback for unknown permission %s", permID)
+		return
+	}
+
+	if err := b.oc.RespondToPermission(ctx, perm.sessionID, permID, reply); err != nil {
+		b.log.Log("RespondToPermission error: %v", err)
+		// Still update the message so the user sees feedback.
+	}
+
+	var label string
+	switch reply {
+	case "once":
+		label = "✅ Approved (once)"
+	case "always":
+		label = "♾ Approved (always)"
+	case "reject":
+		label = "❌ Rejected"
+	}
+
+	removeKeyboard := tgbotapi.NewEditMessageReplyMarkup(perm.chatID, perm.msgID,
+		tgbotapi.InlineKeyboardMarkup{InlineKeyboard: [][]tgbotapi.InlineKeyboardButton{}})
+	b.api.Request(removeKeyboard) //nolint:errcheck
+
+	resultMsg := tgbotapi.NewMessage(perm.chatID, label)
+	b.api.Send(resultMsg) //nolint:errcheck
 }
 
 // sendReply sends a text reply to a message, splitting into multiple messages if needed.

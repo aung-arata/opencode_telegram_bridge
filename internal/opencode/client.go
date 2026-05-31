@@ -187,6 +187,22 @@ func (c *Client) SendMessage(ctx context.Context, sessionID, content string) err
 // StreamCallback is called with accumulated text chunks during SSE streaming.
 type StreamCallback func(accumulated string)
 
+// PermissionRequest is received when OpenCode needs the user to approve a tool
+// action (e.g. running a shell command or writing a file).
+type PermissionRequest struct {
+	ID         string         `json:"id"`
+	SessionID  string         `json:"sessionID"`
+	Permission string         `json:"permission"`
+	Patterns   []string       `json:"patterns"`
+	Metadata   map[string]any `json:"metadata"`
+	Always     []string       `json:"always"`
+}
+
+// PermissionCallback is invoked (from the SSE goroutine) when OpenCode emits a
+// permission.asked event. The callback must return quickly; responding to the
+// permission request happens asynchronously via RespondToPermission.
+type PermissionCallback func(req PermissionRequest)
+
 // sseEvent represents a parsed Server-Sent Event.
 type sseEvent struct {
 	Event string
@@ -341,7 +357,43 @@ func (c *Client) StreamResponse(ctx context.Context, sessionID string, onChunk S
 		return "", err
 	}
 	defer resp.Body.Close()
-	return c.readSSE(resp.Body, sessionID, onChunk)
+	return c.readSSE(resp.Body, sessionID, onChunk, nil)
+}
+
+// RespondToPermission sends a permission reply to OpenCode.
+// reply must be one of "once", "always", or "reject".
+func (c *Client) RespondToPermission(ctx context.Context, sessionID, permissionID, reply string) error {
+	ctx, cancel := context.WithTimeout(ctx, c.sessionTimeout)
+	defer cancel()
+
+	type replyBody struct {
+		Response string `json:"response"`
+	}
+	body, err := json.Marshal(replyBody{Response: reply})
+	if err != nil {
+		return fmt.Errorf("marshal permission reply: %w", err)
+	}
+
+	url := c.baseURL + "/session/" + sessionID + "/permissions/" + permissionID
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("permission reply request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("permission reply: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		respBody, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("permission reply: HTTP %d: %s", resp.StatusCode, string(respBody))
+	}
+
+	c.log.Log("Permission reply sent [session=%s perm=%s reply=%s]", sessionID, permissionID, reply)
+	return nil
 }
 
 // readSSE reads an SSE stream and returns the accumulated response text.
@@ -351,12 +403,16 @@ func (c *Client) StreamResponse(ctx context.Context, sessionID string, onChunk S
 // "message.part.delta" events (field=="text"), and completion is signalled by
 // a "session.idle" event for the current session.
 //
+// When a "permission.asked" event is received, onPermission is invoked (if
+// non-nil) and readSSE continues listening — OpenCode will resume once the
+// permission reply is sent via RespondToPermission.
+//
 // Termination rules:
 //  1. A completion event is received → return immediately (success).
 //  2. The server closes the stream (EOF) → success; if content was accumulated
 //     it is returned as-is, if not the caller will show a fallback message.
 //  3. Scanner error → return whatever was collected plus the error.
-func (c *Client) readSSE(r io.Reader, sessionID string, onChunk StreamCallback) (string, error) {
+func (c *Client) readSSE(r io.Reader, sessionID string, onChunk StreamCallback, onPermission PermissionCallback) (string, error) {
 	scanner := bufio.NewScanner(r)
 	// Use the pre-defined buffer constants to handle large SSE payloads (e.g.
 	// full code blocks) without scanner buffer overflow.
@@ -395,6 +451,17 @@ func (c *Client) readSSE(r io.Reader, sessionID string, onChunk StreamCallback) 
 
 					c.log.Log("SSE[%s] event #%d type=%q data=%s", sessionID, eventCount,
 						ge.Payload.Type, sseDataSnippet(data))
+
+					// Notify the caller when OpenCode needs permission to use a tool.
+					if ge.Payload.Type == "permission.asked" && onPermission != nil {
+						var req PermissionRequest
+						if json.Unmarshal(ge.Payload.Properties, &req) == nil {
+							c.log.Log("SSE[%s] permission.asked id=%s permission=%q", sessionID, req.ID, req.Permission)
+							onPermission(req)
+						}
+						currentEvent = sseEvent{}
+						continue
+					}
 
 					// Extract streaming text from message.part.delta events.
 					if ge.Payload.Type == "message.part.delta" {
@@ -480,7 +547,9 @@ func sseDataSnippet(data string) string {
 
 // Query sends a message to OpenCode and streams the response back.
 // It handles session creation/reuse for the given Telegram chat ID.
-func (c *Client) Query(ctx context.Context, chatID int64, text string, onChunk StreamCallback) (string, error) {
+// onPermission is called (from the SSE goroutine) for each permission.asked
+// event; pass nil to ignore permission events.
+func (c *Client) Query(ctx context.Context, chatID int64, text string, onChunk StreamCallback, onPermission PermissionCallback) (string, error) {
 	sessionID, err := c.GetOrCreateSession(ctx, chatID)
 	if err != nil {
 		return "", fmt.Errorf("get session: %w", err)
@@ -506,7 +575,7 @@ func (c *Client) Query(ctx context.Context, chatID int64, text string, onChunk S
 	resultCh := make(chan sseResult, 1)
 	go func() {
 		defer sseResp.Body.Close()
-		t, e := c.readSSE(sseResp.Body, sessionID, onChunk)
+		t, e := c.readSSE(sseResp.Body, sessionID, onChunk, onPermission)
 		resultCh <- sseResult{t, e}
 	}()
 
@@ -536,7 +605,7 @@ func (c *Client) Query(ctx context.Context, chatID int64, text string, onChunk S
 		resultCh = make(chan sseResult, 1)
 		go func() {
 			defer sseResp2.Body.Close()
-			t, e := c.readSSE(sseResp2.Body, sessionID, onChunk)
+			t, e := c.readSSE(sseResp2.Body, sessionID, onChunk, onPermission)
 			resultCh <- sseResult{t, e}
 		}()
 
