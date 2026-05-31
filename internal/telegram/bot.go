@@ -218,7 +218,11 @@ func (b *Bot) handleQuery(ctx context.Context, chatID int64, replyTo int, query 
 	}
 
 	response, err := b.oc.Query(ctx, chatID, query, onChunk, func(req opencode.PermissionRequest) {
-		b.handlePermissionRequest(chatID, req)
+		if isDangerous(req) {
+			b.handlePermissionRequest(chatID, req)
+		} else {
+			b.autoApprovePermission(ctx, chatID, req)
+		}
 	})
 	if err != nil {
 		b.log.Log("OpenCode query error: %v", err)
@@ -245,6 +249,77 @@ func (b *Bot) handleQuery(ctx context.Context, chatID int64, replyTo int, query 
 			}
 		}
 	}
+}
+
+// dangerousCommands is the set of bash commands that require explicit user approval.
+var dangerousCommands = []string{
+	"rm", "rmdir", "dd", "shred", "truncate", "mkfs", "wipefs", "parted", "fdisk",
+}
+
+// isDangerous reports whether a permission request should be presented to the
+// user for approval. Safe read/list/create operations are auto-approved.
+func isDangerous(req opencode.PermissionRequest) bool {
+	switch req.Permission {
+	case "external_directory":
+		// Any out-of-project directory access requires explicit approval.
+		return true
+	case "bash":
+		for _, p := range req.Patterns {
+			if containsDangerousCommand(p) {
+				return true
+			}
+		}
+		return false
+	default:
+		// Unknown tools: auto-approve (read_file, list_directory, etc.).
+		return false
+	}
+}
+
+// containsDangerousCommand returns true if the bash pattern invokes a
+// destructive command either as the first token or inside a pipeline/chain.
+func containsDangerousCommand(pattern string) bool {
+	pattern = strings.TrimSpace(pattern)
+	parts := strings.Fields(pattern)
+	if len(parts) == 0 {
+		return false
+	}
+	// Resolve the base command name (handles /bin/rm → rm, /usr/bin/dd → dd).
+	first := strings.ToLower(filepath.Base(parts[0]))
+	for _, d := range dangerousCommands {
+		// Exact match or variant like mkfs.ext4 matching mkfs.
+		if first == d || strings.HasPrefix(first, d+".") {
+			return true
+		}
+	}
+	// Check for dangerous commands embedded in a pipeline or command chain.
+	lower := strings.ToLower(pattern)
+	for _, d := range dangerousCommands {
+		if strings.Contains(lower, " "+d+" ") ||
+			strings.Contains(lower, "|"+d+" ") ||
+			strings.Contains(lower, ";"+d+" ") ||
+			strings.HasSuffix(lower, " "+d) {
+			return true
+		}
+	}
+	return false
+}
+
+// autoApprovePermission responds to a permission request with "always" without
+// user interaction and sends a brief informational message to the chat.
+func (b *Bot) autoApprovePermission(ctx context.Context, chatID int64, req opencode.PermissionRequest) {
+	patterns := strings.Join(req.Patterns, ", ")
+	if patterns == "" {
+		patterns = "(any)"
+	}
+	if err := b.oc.RespondToPermission(ctx, req.SessionID, req.ID, "always"); err != nil {
+		b.log.Log("Auto-approve failed [perm=%s tool=%s]: %v", req.ID, req.Permission, err)
+		// Fall back to the manual keyboard.
+		b.handlePermissionRequest(chatID, req)
+		return
+	}
+	b.log.Log("Auto-approved [tool=%s patterns=%s]", req.Permission, patterns)
+	b.sendReply(chatID, 0, fmt.Sprintf("✅ Auto-approved: %s (%s)", req.Permission, patterns))
 }
 
 // handlePermissionRequest sends a Telegram message with an inline keyboard

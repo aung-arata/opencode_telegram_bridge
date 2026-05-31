@@ -9,6 +9,7 @@ import (
 
 	"github.com/aung-arata/opencode-telegram-bridge/internal/config"
 	"github.com/aung-arata/opencode-telegram-bridge/internal/logger"
+	"github.com/aung-arata/opencode-telegram-bridge/internal/opencode"
 )
 
 // ---------------------------------------------------------------------------
@@ -215,3 +216,69 @@ func TestSaveLastUpdateID_LargeID(t *testing.T) {
 		t.Fatalf("want %d, got %d", large, got)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// isDangerous / containsDangerousCommand
+// ---------------------------------------------------------------------------
+
+func TestIsDangerous_ExternalDirectory(t *testing.T) {
+	req := opencode.PermissionRequest{Permission: "external_directory", Patterns: []string{"/*"}}
+	if !isDangerous(req) {
+		t.Fatal("external_directory should always be dangerous")
+	}
+}
+
+func TestIsDangerous_UnknownTool_AutoApproved(t *testing.T) {
+	req := opencode.PermissionRequest{Permission: "read_file", Patterns: []string{"/tmp/foo"}}
+	if isDangerous(req) {
+		t.Fatal("unknown tool should be auto-approved (not dangerous)")
+	}
+}
+
+func TestIsDangerous_BashSafeCommands(t *testing.T) {
+	safe := []string{
+		"ls /",
+		"mkdir /test_server",
+		"cat /etc/hosts",
+		"grep -r foo .",
+		"find / -name '*.go'",
+		"echo hello",
+		"pwd",
+	}
+	for _, p := range safe {
+		req := opencode.PermissionRequest{Permission: "bash", Patterns: []string{p}}
+		if isDangerous(req) {
+			t.Errorf("expected safe, got dangerous for pattern %q", p)
+		}
+	}
+}
+
+func TestIsDangerous_BashDangerousCommands(t *testing.T) {
+	dangerous := []string{
+		"rm -rf /",
+		"rmdir /tmp/stuff",
+		"dd if=/dev/zero of=/dev/sda",
+		"shred /dev/sda",
+		"truncate -s 0 important.db",
+		"mkfs.ext4 /dev/sdb",
+		"/bin/rm foo",
+		"ls | rm -rf",
+	}
+	for _, p := range dangerous {
+		req := opencode.PermissionRequest{Permission: "bash", Patterns: []string{p}}
+		if !isDangerous(req) {
+			t.Errorf("expected dangerous, got safe for pattern %q", p)
+		}
+	}
+}
+
+func TestIsDangerous_BashMultiplePatterns_AnyDangerous(t *testing.T) {
+	req := opencode.PermissionRequest{
+		Permission: "bash",
+		Patterns:   []string{"ls /", "rm -rf /tmp/work"},
+	}
+	if !isDangerous(req) {
+		t.Fatal("should be dangerous when any pattern is dangerous")
+	}
+}
+
