@@ -3,6 +3,7 @@ package telegram
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -226,8 +227,13 @@ func (b *Bot) handleQuery(ctx context.Context, chatID int64, replyTo int, query 
 	})
 	if err != nil {
 		b.log.Log("OpenCode query error: %v", err)
-		errMsg := fmt.Sprintf("❌ OpenCode error: %v", err)
-		edit := tgbotapi.NewEditMessageText(chatID, placeholder.MessageID, errMsg)
+		var editText string
+		if isTimeoutError(err) {
+			editText = "⏱ Query timed out — OpenCode is still processing.\n\nSend /abort to cancel, or wait and retry."
+		} else {
+			editText = fmt.Sprintf("❌ OpenCode error: %v", err)
+		}
+		edit := tgbotapi.NewEditMessageText(chatID, placeholder.MessageID, editText)
 		b.api.Send(edit)
 		return
 	}
@@ -419,6 +425,19 @@ func (b *Bot) handleCallbackQuery(ctx context.Context, cq *tgbotapi.CallbackQuer
 
 	resultMsg := tgbotapi.NewMessage(perm.chatID, label)
 	b.api.Send(resultMsg) //nolint:errcheck
+}
+
+// isTimeoutError reports whether err was caused by a context deadline or
+// cancellation (including when wrapped inside a url.Error from http).
+func isTimeoutError(err error) bool {
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+		return true
+	}
+	var netErr interface{ Timeout() bool }
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return true
+	}
+	return false
 }
 
 // sendReply sends a text reply to a message, splitting into multiple messages if needed.
