@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -364,7 +365,7 @@ func TestReadSSE_GlobalEvent_TextAndIdle(t *testing.T) {
 
 	var chunks []string
 	c := newTestClient("http://unused")
-	got, err := c.readSSE(strings.NewReader(raw), sid, func(acc string) { chunks = append(chunks, acc) })
+	got, err := c.readSSE(strings.NewReader(raw), sid, func(acc string) { chunks = append(chunks, acc) }, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -385,7 +386,7 @@ func TestReadSSE_SkipsOtherSession(t *testing.T) {
 	raw := sseLines("", other) + sseLines("", mine) + sseLines("", idle)
 
 	c := newTestClient("http://unused")
-	got, err := c.readSSE(strings.NewReader(raw), sid, nil)
+	got, err := c.readSSE(strings.NewReader(raw), sid, nil, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -399,7 +400,7 @@ func TestReadSSE_LegacySSE_CompletionByEvent(t *testing.T) {
 	raw := sseLines("", `{"content":"legacy text"}`) + sseLines("done", "[DONE]")
 
 	c := newTestClient("http://unused")
-	got, err := c.readSSE(strings.NewReader(raw), "ses_x", nil)
+	got, err := c.readSSE(strings.NewReader(raw), "ses_x", nil, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -413,7 +414,7 @@ func TestReadSSE_EOFWithContent(t *testing.T) {
 	raw := sseLines("", `{"content":"partial"}`)
 
 	c := newTestClient("http://unused")
-	got, err := c.readSSE(strings.NewReader(raw), "ses_x", nil)
+	got, err := c.readSSE(strings.NewReader(raw), "ses_x", nil, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -424,12 +425,75 @@ func TestReadSSE_EOFWithContent(t *testing.T) {
 
 func TestReadSSE_EmptyStream(t *testing.T) {
 	c := newTestClient("http://unused")
-	got, err := c.readSSE(strings.NewReader(""), "ses_x", nil)
+	got, err := c.readSSE(strings.NewReader(""), "ses_x", nil, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if got != "" {
 		t.Fatalf("want empty, got %q", got)
+	}
+}
+
+func TestReadSSE_PermissionAsked_CallbackInvoked(t *testing.T) {
+	sid := "ses_perm"
+	permEvent := globalEventJSON(t, "permission.asked", PermissionRequest{
+		ID:         "per_abc",
+		SessionID:  sid,
+		Permission: "bash",
+		Patterns:   []string{"ls /tmp"},
+		Always:     []string{},
+		Metadata:   map[string]any{},
+	})
+	text := globalEventJSON(t, "message.part.delta", partDeltaProperties{SessionID: sid, Field: "text", Delta: "done"})
+	idle := globalEventJSON(t, "session.idle", sessionEventProperties{SessionID: sid})
+
+	raw := sseLines("", permEvent) + sseLines("", text) + sseLines("", idle)
+
+	var got PermissionRequest
+	c := newTestClient("http://unused")
+	result, err := c.readSSE(strings.NewReader(raw), sid, nil, func(req PermissionRequest) {
+		got = req
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result != "done" {
+		t.Fatalf("want %q, got %q", "done", result)
+	}
+	if got.ID != "per_abc" {
+		t.Fatalf("want permissionID %q, got %q", "per_abc", got.ID)
+	}
+	if got.Permission != "bash" {
+		t.Fatalf("want permission %q, got %q", "bash", got.Permission)
+	}
+}
+
+func TestRespondToPermission_OK(t *testing.T) {
+	var gotBody []byte
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost && r.URL.Path == "/session/ses_x/permissions/per_y" {
+			gotBody, _ = io.ReadAll(r.Body)
+			w.Header().Set("Content-Type", "application/json")
+			w.Write([]byte("null"))
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer srv.Close()
+
+	c := newTestClient(srv.URL)
+	err := c.RespondToPermission(context.Background(), "ses_x", "per_y", "once")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	var body struct {
+		Response string `json:"response"`
+	}
+	if err := json.Unmarshal(gotBody, &body); err != nil {
+		t.Fatalf("unmarshal body: %v", err)
+	}
+	if body.Response != "once" {
+		t.Fatalf("want response %q, got %q", "once", body.Response)
 	}
 }
 
@@ -485,7 +549,7 @@ func TestQuery_FullRoundTrip(t *testing.T) {
 	defer srv.Close()
 
 	c := newTestClient(srv.URL)
-	got, err := c.Query(context.Background(), 42, "what is the answer?", nil)
+	got, err := c.Query(context.Background(), 42, "what is the answer?", nil, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -502,7 +566,7 @@ func TestQuery_StreamingCallbacks(t *testing.T) {
 	var chunks []string
 	c.Query(context.Background(), 42, "stream test", func(acc string) {
 		chunks = append(chunks, acc)
-	})
+	}, nil)
 	if len(chunks) == 0 {
 		t.Fatal("expected at least one streaming callback")
 	}
@@ -531,7 +595,7 @@ func TestQuery_SendMessageFailure_ReturnError(t *testing.T) {
 	defer srv.Close()
 
 	c := newTestClient(srv.URL)
-	_, err := c.Query(context.Background(), 42, "will fail", nil)
+	_, err := c.Query(context.Background(), 42, "will fail", nil, nil)
 	if err == nil {
 		t.Fatal("expected error when message POST fails")
 	}
