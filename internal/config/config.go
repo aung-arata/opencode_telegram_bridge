@@ -57,7 +57,7 @@ func Load() (*Config, error) {
 		ocURL = "http://127.0.0.1:4096"
 	}
 
-	sessionTimeout := 30 * time.Second
+	sessionTimeout := 10 * time.Minute
 	if s := os.Getenv("OPENCODE_SESSION_TIMEOUT"); s != "" {
 		d, err := time.ParseDuration(s)
 		if err != nil {
