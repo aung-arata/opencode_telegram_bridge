@@ -282,6 +282,74 @@ func TestResetSession_OtherChatUnaffected(t *testing.T) {
 	}
 }
 
+func TestGetSession_ReturnsCachedSession(t *testing.T) {
+	var calls atomic.Int32
+	srv := sessionServer(t, &calls)
+	defer srv.Close()
+
+	c := newTestClient(srv.URL)
+	ctx := context.Background()
+
+	// Before any session exists.
+	_, ok := c.GetSession(42)
+	if ok {
+		t.Fatal("expected no session before any query")
+	}
+
+	sid, _ := c.GetOrCreateSession(ctx, 42)
+
+	got, ok := c.GetSession(42)
+	if !ok {
+		t.Fatal("expected session to exist after GetOrCreateSession")
+	}
+	if got != sid {
+		t.Fatalf("want %q, got %q", sid, got)
+	}
+
+	// After reset, should be gone again.
+	c.ResetSession(42)
+	_, ok = c.GetSession(42)
+	if ok {
+		t.Fatal("expected no session after ResetSession")
+	}
+}
+
+func TestAbort_SendsCorrectRequest(t *testing.T) {
+	var abortPath string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/abort") {
+			abortPath = r.URL.Path
+			w.Header().Set("Content-Type", "application/json")
+			w.Write([]byte("true"))
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer srv.Close()
+
+	c := newTestClient(srv.URL)
+	err := c.Abort(context.Background(), "ses_test")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if abortPath != "/session/ses_test/abort" {
+		t.Fatalf("want path /session/ses_test/abort, got %q", abortPath)
+	}
+}
+
+func TestAbort_ErrorOnNonOK(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "session not found", http.StatusNotFound)
+	}))
+	defer srv.Close()
+
+	c := newTestClient(srv.URL)
+	err := c.Abort(context.Background(), "ses_missing")
+	if err == nil {
+		t.Fatal("expected error for non-200 response")
+	}
+}
+
 // ---------------------------------------------------------------------------
 // extractText
 // ---------------------------------------------------------------------------

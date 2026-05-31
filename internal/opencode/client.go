@@ -109,6 +109,43 @@ func (c *Client) ResetSession(chatID int64) {
 	c.mu.Unlock()
 }
 
+// GetSession returns the current session ID for the chat, if one exists.
+// Unlike GetOrCreateSession it never creates a new session.
+func (c *Client) GetSession(chatID int64) (string, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	sid, ok := c.sessions[chatID]
+	return sid, ok
+}
+
+// Abort sends a POST /session/{id}/abort request, interrupting any active
+// processing in that session. It is safe to call even if no query is running.
+func (c *Client) Abort(ctx context.Context, sessionID string) error {
+	ctx, cancel := context.WithTimeout(ctx, c.sessionTimeout)
+	defer cancel()
+
+	url := c.baseURL + "/session/" + sessionID + "/abort"
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader([]byte("{}")))
+	if err != nil {
+		return fmt.Errorf("abort request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("abort: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("abort: HTTP %d: %s", resp.StatusCode, string(body))
+	}
+
+	c.log.Log("Abort sent [session=%s]", sessionID)
+	return nil
+}
+
 // GetOrCreateSession returns an existing session for the chat, or creates one.
 func (c *Client) GetOrCreateSession(ctx context.Context, chatID int64) (string, error) {
 	c.mu.Lock()

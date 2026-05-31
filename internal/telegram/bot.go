@@ -127,6 +127,8 @@ func (b *Bot) handleMessage(ctx context.Context, msg *tgbotapi.Message) {
 		b.cmdHelp(chatID, msgID)
 	case text == "/newsession":
 		b.cmdNewSession(chatID, msgID)
+	case text == "/abort":
+		b.cmdAbort(ctx, chatID, msgID)
 	case strings.HasPrefix(text, "/echo "):
 		b.sendReply(chatID, msgID, strings.TrimPrefix(text, "/echo "))
 	case strings.HasPrefix(text, "/ask "):
@@ -145,6 +147,7 @@ func (b *Bot) cmdHelp(chatID int64, replyTo int) {
 		"Send any plain message → forwarded to OpenCode as a query.\n\n" +
 		"Commands:\n" +
 		"/ask <query>  — explicit OpenCode query\n" +
+		"/abort        — cancel the running query\n" +
 		"/newsession   — start a fresh OpenCode session\n" +
 		"/echo <msg>   — bot replies with your message\n" +
 		"/help         — show this help\n\n" +
@@ -152,6 +155,24 @@ func (b *Bot) cmdHelp(chatID int64, replyTo int) {
 		fmt.Sprintf("Session timeout: %s\n", b.cfg.OpenCodeSessionTimeout) +
 		fmt.Sprintf("Log: %s", b.cfg.LogFile)
 	b.sendReply(chatID, replyTo, help)
+}
+
+// cmdAbort cancels any active OpenCode query for the chat by calling the
+// abort endpoint. The running SSE stream will receive a session.idle event
+// and terminate naturally, editing the placeholder with whatever was streamed
+// up to the abort.
+func (b *Bot) cmdAbort(ctx context.Context, chatID int64, replyTo int) {
+	sid, ok := b.oc.GetSession(chatID)
+	if !ok {
+		b.sendReply(chatID, replyTo, "⚠️ No active session to abort.")
+		return
+	}
+	if err := b.oc.Abort(ctx, sid); err != nil {
+		b.log.Log("Abort error [chat=%d session=%s]: %v", chatID, sid, err)
+		b.sendReply(chatID, replyTo, fmt.Sprintf("❌ Abort failed: %v", err))
+		return
+	}
+	b.sendReply(chatID, replyTo, "⏹ Query aborted.")
 }
 
 // cmdNewSession drops the current OpenCode session so the next query starts fresh.
