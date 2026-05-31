@@ -73,6 +73,8 @@ Sends a single message to the chat configured by `TG_CHAT_ID`. Useful for automa
 |---|---|
 | `<any plain text>` | Forward as query to OpenCode |
 | `/ask <query>` | Explicit OpenCode query |
+| `/abort` | Cancel the running query mid-stream |
+| `/newsession` | Start a fresh OpenCode session |
 | `/echo <msg>` | Bot replies with the same text |
 | `/help` | Show command reference and status |
 
@@ -92,8 +94,8 @@ TG_CHAT_ID=123456789
 # OpenCode server URL (default: http://127.0.0.1:4096)
 OPENCODE_URL=http://127.0.0.1:4096
 
-# Session timeout for HTTP requests (default: 30s)
-OPENCODE_SESSION_TIMEOUT=30s
+# Session timeout for OpenCode queries (default: 10m)
+OPENCODE_SESSION_TIMEOUT=10m
 ```
 
 | Variable | Required by | Purpose |
@@ -102,7 +104,7 @@ OPENCODE_SESSION_TIMEOUT=30s
 | `TG_USER_ID` | `bridge` | Your Telegram numeric user ID |
 | `TG_CHAT_ID` | `notify` | Target chat for notifications |
 | `OPENCODE_URL` | `bridge` | OpenCode HTTP server base URL |
-| `OPENCODE_SESSION_TIMEOUT` | `bridge` | Timeout for OpenCode HTTP requests |
+| `OPENCODE_SESSION_TIMEOUT` | `bridge` | Timeout per query (e.g. `10m`, `5m`) |
 
 ---
 
@@ -111,8 +113,10 @@ OPENCODE_SESSION_TIMEOUT=30s
 The bridge communicates with OpenCode via its HTTP server:
 
 1. **`POST /session`** — create a new session, returns `{ "id": "..." }`
-2. **`POST /session/{sessionId}/message`** — send a message/prompt to a session
-3. **`GET /session/{sessionId}/events`** — SSE stream of response chunks
+2. **`POST /session/{id}/message`** — send a prompt, returns an SSE stream of response chunks
+3. **`GET /global/event`** — persistent SSE stream for all session events
+4. **`POST /session/{id}/permissions/{permissionID}`** — respond to a tool permission request (`once`, `always`, `reject`)
+5. **`POST /session/{id}/abort`** — cancel any active processing in the session
 
 Start OpenCode in server mode before running the bridge:
 
