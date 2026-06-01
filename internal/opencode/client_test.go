@@ -97,12 +97,30 @@ func TestCreateSession_Success(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	sid, err := newTestClient(srv.URL).CreateSession(context.Background())
+	sid, err := newTestClient(srv.URL).CreateSession(context.Background(), "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if sid != "ses_abc" {
 		t.Fatalf("want ses_abc, got %q", sid)
+	}
+}
+
+func TestCreateSession_SendsAgentField(t *testing.T) {
+	var gotBody map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewDecoder(r.Body).Decode(&gotBody)
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(createSessionResponse{ID: "ses_plan"})
+	}))
+	defer srv.Close()
+
+	_, err := newTestClient(srv.URL).CreateSession(context.Background(), "plan")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got, _ := gotBody["agent"].(string); got != "plan" {
+		t.Fatalf("want agent=plan in body, got %v", gotBody)
 	}
 }
 
@@ -112,7 +130,7 @@ func TestCreateSession_HTTPError(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	_, err := newTestClient(srv.URL).CreateSession(context.Background())
+	_, err := newTestClient(srv.URL).CreateSession(context.Background(), "")
 	if err == nil {
 		t.Fatal("expected error for HTTP 500")
 	}
@@ -125,9 +143,36 @@ func TestCreateSession_EmptyID(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	_, err := newTestClient(srv.URL).CreateSession(context.Background())
+	_, err := newTestClient(srv.URL).CreateSession(context.Background(), "")
 	if err == nil {
 		t.Fatal("expected error for empty session ID")
+	}
+}
+
+func TestSwitchMode_ReplacesSession(t *testing.T) {
+	var calls atomic.Int32
+	srv := sessionServer(t, &calls)
+	defer srv.Close()
+
+	c := newTestClient(srv.URL)
+	ctx := context.Background()
+
+	// Create an initial session.
+	sid1, _ := c.GetOrCreateSession(ctx, 42)
+
+	// Switch mode — should replace the cached session.
+	sid2, err := c.SwitchMode(ctx, 42, "plan")
+	if err != nil {
+		t.Fatalf("SwitchMode error: %v", err)
+	}
+	if sid1 == sid2 {
+		t.Fatal("expected a new session ID after SwitchMode")
+	}
+
+	// GetSession should now return sid2.
+	got, ok := c.GetSession(42)
+	if !ok || got != sid2 {
+		t.Fatalf("want %q, got %q (ok=%v)", sid2, got, ok)
 	}
 }
 

@@ -61,18 +61,29 @@ func (c *Client) Close() {
 	c.mu.Unlock()
 }
 
+// createSessionRequest is the optional JSON body for POST /session.
+type createSessionRequest struct {
+	Agent string `json:"agent,omitempty"`
+}
+
 // createSessionResponse is the JSON returned by POST /session.
 type createSessionResponse struct {
 	ID string `json:"id"`
 }
 
 // CreateSession creates a new OpenCode session and returns its ID.
-func (c *Client) CreateSession(ctx context.Context) (string, error) {
+// Pass an empty agent string for the default (build) mode.
+func (c *Client) CreateSession(ctx context.Context, agent string) (string, error) {
 	ctx, cancel := context.WithTimeout(ctx, c.sessionTimeout)
 	defer cancel()
 
+	body, err := json.Marshal(createSessionRequest{Agent: agent})
+	if err != nil {
+		return "", fmt.Errorf("marshal create session: %w", err)
+	}
+
 	url := c.baseURL + "/session"
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader([]byte("{}")))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
 		return "", fmt.Errorf("create session request: %w", err)
 	}
@@ -146,7 +157,8 @@ func (c *Client) Abort(ctx context.Context, sessionID string) error {
 	return nil
 }
 
-// GetOrCreateSession returns an existing session for the chat, or creates one.
+// GetOrCreateSession returns an existing session for the chat, or creates one
+// with the default (build) agent.
 func (c *Client) GetOrCreateSession(ctx context.Context, chatID int64) (string, error) {
 	c.mu.Lock()
 	sid, ok := c.sessions[chatID]
@@ -156,7 +168,7 @@ func (c *Client) GetOrCreateSession(ctx context.Context, chatID int64) (string, 
 		return sid, nil
 	}
 
-	sid, err := c.CreateSession(ctx)
+	sid, err := c.CreateSession(ctx, "")
 	if err != nil {
 		return "", err
 	}
@@ -165,6 +177,19 @@ func (c *Client) GetOrCreateSession(ctx context.Context, chatID int64) (string, 
 	c.sessions[chatID] = sid
 	c.mu.Unlock()
 
+	return sid, nil
+}
+
+// SwitchMode creates a new session for chatID with the given agent ("plan" or ""
+// for build) and replaces the cached session so the next query uses it.
+func (c *Client) SwitchMode(ctx context.Context, chatID int64, agent string) (string, error) {
+	sid, err := c.CreateSession(ctx, agent)
+	if err != nil {
+		return "", err
+	}
+	c.mu.Lock()
+	c.sessions[chatID] = sid
+	c.mu.Unlock()
 	return sid, nil
 }
 
