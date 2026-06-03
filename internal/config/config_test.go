@@ -132,7 +132,7 @@ func TestLoad_MinimalValid(t *testing.T) {
 	if cfg.OpenCodeURL != "http://127.0.0.1:4096" {
 		t.Fatalf("default OpenCodeURL: got %q", cfg.OpenCodeURL)
 	}
-	if cfg.OpenCodeSessionTimeout != 30*time.Second {
+	if cfg.OpenCodeSessionTimeout != 10*time.Minute {
 		t.Fatalf("default timeout: got %v", cfg.OpenCodeSessionTimeout)
 	}
 	if cfg.RuntimeDir != "runtime" {

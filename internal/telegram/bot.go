@@ -130,6 +130,10 @@ func (b *Bot) handleMessage(ctx context.Context, msg *tgbotapi.Message) {
 		b.cmdNewSession(chatID, msgID)
 	case text == "/abort":
 		b.cmdAbort(ctx, chatID, msgID)
+	case text == "/plan":
+		b.cmdSwitchMode(ctx, chatID, msgID, "plan")
+	case text == "/build":
+		b.cmdSwitchMode(ctx, chatID, msgID, "")
 	case strings.HasPrefix(text, "/echo "):
 		b.sendReply(chatID, msgID, strings.TrimPrefix(text, "/echo "))
 	case strings.HasPrefix(text, "/ask "):
@@ -149,6 +153,8 @@ func (b *Bot) cmdHelp(chatID int64, replyTo int) {
 		"Commands:\n" +
 		"/ask <query>  — explicit OpenCode query\n" +
 		"/abort        — cancel the running query\n" +
+		"/plan         — switch to plan mode (read-only analysis)\n" +
+		"/build        — switch to build mode (full access, default)\n" +
 		"/newsession   — start a fresh OpenCode session\n" +
 		"/echo <msg>   — bot replies with your message\n" +
 		"/help         — show this help\n\n" +
@@ -185,6 +191,31 @@ func (b *Bot) cmdNewSession(chatID int64, replyTo int) {
 	b.oc.ResetSession(chatID)
 	b.log.Log("Session reset for chat=%d", chatID)
 	b.sendReply(chatID, replyTo, "\U0001F195 Session context cleared. Your next message will start a fresh OpenCode session.")
+}
+
+// cmdSwitchMode creates a new OpenCode session with the given agent mode and
+// makes it the active session for the chat.
+// agent="" → build (default, full file access)
+// agent="plan" → plan (read-only analysis, no file writes)
+func (b *Bot) cmdSwitchMode(ctx context.Context, chatID int64, replyTo int, agent string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	sid, err := b.oc.SwitchMode(ctx, chatID, agent)
+	if err != nil {
+		b.log.Log("SwitchMode error [chat=%d agent=%q]: %v", chatID, agent, err)
+		b.sendReply(chatID, replyTo, fmt.Sprintf("❌ Failed to switch mode: %v", err))
+		return
+	}
+
+	var reply string
+	if agent == "plan" {
+		reply = "📋 Switched to plan mode — read-only analysis, no file changes.\n\nSession: " + sid
+	} else {
+		reply = "🔨 Switched to build mode — full access.\n\nSession: " + sid
+	}
+	b.log.Log("Mode switch [chat=%d agent=%q session=%s]", chatID, agent, sid)
+	b.sendReply(chatID, replyTo, reply)
 }
 
 // handleQuery sends a query to OpenCode and streams the response back.
