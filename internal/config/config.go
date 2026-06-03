@@ -20,8 +20,9 @@ type Config struct {
 	OpenCodeURL            string
 	OpenCodeSessionTimeout time.Duration
 
-	RuntimeDir string
-	LogFile    string
+	RuntimeDir  string
+	LogFile     string
+	SessionFile string
 }
 
 // Load reads configuration from the .env file and environment variables.
@@ -79,6 +80,7 @@ func Load() (*Config, error) {
 		OpenCodeSessionTimeout: sessionTimeout,
 		RuntimeDir:             runtimeDir,
 		LogFile:                filepath.Join(runtimeDir, "oc_bridge.log"),
+		SessionFile:            filepath.Join(runtimeDir, "sessions.json"),
 	}, nil
 }
 

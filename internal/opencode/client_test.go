@@ -21,7 +21,7 @@ import (
 
 // newTestClient creates a Client pointed at the given test server URL.
 func newTestClient(serverURL string) *Client {
-	return NewClient(serverURL, 5*time.Second, logger.New(""))
+	return NewClient(serverURL, 5*time.Second, logger.New(""), "")
 }
 
 // itoa converts an int32 to its decimal string without importing strconv.

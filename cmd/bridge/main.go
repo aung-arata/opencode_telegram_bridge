@@ -31,7 +31,7 @@ func main() {
 	log.Log("OpenCode URL: %s", cfg.OpenCodeURL)
 	log.Log("Session timeout: %s", cfg.OpenCodeSessionTimeout)
 
-	oc := opencode.NewClient(cfg.OpenCodeURL, cfg.OpenCodeSessionTimeout, log)
+	oc := opencode.NewClient(cfg.OpenCodeURL, cfg.OpenCodeSessionTimeout, log, cfg.SessionFile)
 	defer oc.Close()
 
 	bot, err := telegram.NewBot(cfg, log, oc)

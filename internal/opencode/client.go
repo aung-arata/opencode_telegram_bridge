@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -37,20 +38,66 @@ type Client struct {
 	httpClient     *http.Client // used for short-lived POST requests (has Timeout)
 	sseHTTPClient  *http.Client // used for SSE GET requests (no Timeout)
 	log            *logger.Logger
+	sessionFile    string // path to persist chatID→sessionID mapping
 
 	mu       sync.Mutex
 	sessions map[int64]string // Telegram chatID → OpenCode sessionID
 }
 
 // NewClient creates a new OpenCode HTTP client.
-func NewClient(baseURL string, sessionTimeout time.Duration, log *logger.Logger) *Client {
-	return &Client{
+func NewClient(baseURL string, sessionTimeout time.Duration, log *logger.Logger, sessionFile string) *Client {
+	c := &Client{
 		baseURL:        baseURL,
 		sessionTimeout: sessionTimeout,
 		httpClient:     &http.Client{Timeout: sessionTimeout},
 		sseHTTPClient:  &http.Client{}, // no timeout — stream lifetime is bounded by ctx
 		log:            log,
+		sessionFile:    sessionFile,
 		sessions:       make(map[int64]string),
+	}
+	c.loadSessions()
+	return c
+}
+
+// loadSessions reads persisted chatID→sessionID pairs from disk.
+func (c *Client) loadSessions() {
+	if c.sessionFile == "" {
+		return
+	}
+	data, err := os.ReadFile(c.sessionFile)
+	if err != nil {
+		return // file missing on first run — not an error
+	}
+	var raw map[string]string
+	if err := json.Unmarshal(data, &raw); err != nil {
+		c.log.Log("session file parse error (ignored): %v", err)
+		return
+	}
+	for k, v := range raw {
+		var chatID int64
+		if _, err := fmt.Sscanf(k, "%d", &chatID); err == nil {
+			c.sessions[chatID] = v
+		}
+	}
+	c.log.Log("Loaded %d session(s) from %s", len(c.sessions), c.sessionFile)
+}
+
+// saveSessions writes the current chatID→sessionID map to disk. Must be called with mu held.
+func (c *Client) saveSessions() {
+	if c.sessionFile == "" {
+		return
+	}
+	raw := make(map[string]string, len(c.sessions))
+	for k, v := range c.sessions {
+		raw[fmt.Sprintf("%d", k)] = v
+	}
+	data, err := json.Marshal(raw)
+	if err != nil {
+		c.log.Log("session persist marshal error: %v", err)
+		return
+	}
+	if err := os.WriteFile(c.sessionFile, data, 0600); err != nil {
+		c.log.Log("session persist write error: %v", err)
 	}
 }
 
@@ -117,6 +164,7 @@ func (c *Client) CreateSession(ctx context.Context, agent string) (string, error
 func (c *Client) ResetSession(chatID int64) {
 	c.mu.Lock()
 	delete(c.sessions, chatID)
+	c.saveSessions()
 	c.mu.Unlock()
 }
 
@@ -175,6 +223,7 @@ func (c *Client) GetOrCreateSession(ctx context.Context, chatID int64) (string, 
 
 	c.mu.Lock()
 	c.sessions[chatID] = sid
+	c.saveSessions()
 	c.mu.Unlock()
 
 	return sid, nil
@@ -189,6 +238,7 @@ func (c *Client) SwitchMode(ctx context.Context, chatID int64, agent string) (st
 	}
 	c.mu.Lock()
 	c.sessions[chatID] = sid
+	c.saveSessions()
 	c.mu.Unlock()
 	return sid, nil
 }
@@ -649,6 +699,7 @@ func (c *Client) Query(ctx context.Context, chatID int64, text string, onChunk S
 
 		c.mu.Lock()
 		delete(c.sessions, chatID)
+		c.saveSessions()
 		c.mu.Unlock()
 
 		sessionID, err = c.GetOrCreateSession(ctx, chatID)
