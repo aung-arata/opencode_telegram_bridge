@@ -130,6 +130,8 @@ func (b *Bot) handleMessage(ctx context.Context, msg *tgbotapi.Message) {
 		b.cmdNewSession(chatID, msgID)
 	case text == "/abort":
 		b.cmdAbort(ctx, chatID, msgID)
+	case text == "/diff":
+		b.cmdDiff(ctx, chatID, msgID)
 	case text == "/plan":
 		b.cmdSwitchMode(ctx, chatID, msgID, "plan")
 	case text == "/build":
@@ -153,6 +155,7 @@ func (b *Bot) cmdHelp(chatID int64, replyTo int) {
 		"Commands:\n" +
 		"/ask <query>  — explicit OpenCode query\n" +
 		"/abort        — cancel the running query\n" +
+		"/diff         — show files changed in current session\n" +
 		"/plan         — switch to plan mode (read-only analysis)\n" +
 		"/build        — switch to build mode (full access, default)\n" +
 		"/newsession   — start a fresh OpenCode session\n" +
@@ -180,6 +183,31 @@ func (b *Bot) cmdAbort(ctx context.Context, chatID int64, replyTo int) {
 		return
 	}
 	b.sendReply(chatID, replyTo, "⏹ Query aborted.")
+}
+
+// cmdDiff shows files changed in the current session via GET /session/:id/diff.
+func (b *Bot) cmdDiff(ctx context.Context, chatID int64, replyTo int) {
+	sid, ok := b.oc.GetSession(chatID)
+	if !ok {
+		b.sendReply(chatID, replyTo, "⚠️ No active session.")
+		return
+	}
+	diffs, err := b.oc.Diff(ctx, sid)
+	if err != nil {
+		b.log.Log("Diff error [chat=%d session=%s]: %v", chatID, sid, err)
+		b.sendReply(chatID, replyTo, fmt.Sprintf("❌ Diff failed: %v", err))
+		return
+	}
+	if len(diffs) == 0 {
+		b.sendReply(chatID, replyTo, "✅ No file changes in current session.")
+		return
+	}
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("📝 %d file(s) changed:\n\n", len(diffs)))
+	for _, d := range diffs {
+		sb.WriteString(fmt.Sprintf("`%s` +%d -%d\n", d.File, d.Additions, d.Deletions))
+	}
+	b.sendReply(chatID, replyTo, sb.String())
 }
 
 // cmdNewSession drops the current OpenCode session so the next query starts fresh.
