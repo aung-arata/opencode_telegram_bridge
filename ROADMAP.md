@@ -11,7 +11,7 @@ Features ordered by impact. Items marked ✅ are shipped.
 3. ✅ **`/plan` and `/build` mode switching** — switch between read-only (plan) and full-access (build) agents
 4. ✅ **`/diff` command** — `GET /session/:id/diff` shows files changed in current session; review what OpenCode touched without leaving Telegram
 5. ✅ **Session persistence** — `runtime/sessions.json` survives restarts; previous session resumes automatically
-6. **Session naming** — `PATCH /session/:id` with `{ title }` auto-set from first message; makes sessions recognizable in OpenCode TUI
+6. ✅ **Session naming** — `PATCH /session/:id` with `{ title }` auto-set from first message; makes sessions recognizable in OpenCode TUI
 
 ---
 

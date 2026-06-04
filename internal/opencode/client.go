@@ -40,8 +40,9 @@ type Client struct {
 	log            *logger.Logger
 	sessionFile    string // path to persist chatID→sessionID mapping
 
-	mu       sync.Mutex
-	sessions map[int64]string // Telegram chatID → OpenCode sessionID
+	mu          sync.Mutex
+	sessions    map[int64]string // Telegram chatID → OpenCode sessionID
+	newSessions map[string]bool  // sessionIDs created this run, pending first-message title
 }
 
 // NewClient creates a new OpenCode HTTP client.
@@ -54,6 +55,7 @@ func NewClient(baseURL string, sessionTimeout time.Duration, log *logger.Logger,
 		log:            log,
 		sessionFile:    sessionFile,
 		sessions:       make(map[int64]string),
+		newSessions:    make(map[string]bool),
 	}
 	c.loadSessions()
 	return c
@@ -177,6 +179,55 @@ func (c *Client) GetSession(chatID int64) (string, bool) {
 	return sid, ok
 }
 
+// UpdateSession sets metadata on an existing session. Currently used to set the title.
+func (c *Client) UpdateSession(ctx context.Context, sessionID, title string) error {
+	ctx, cancel := context.WithTimeout(ctx, c.sessionTimeout)
+	defer cancel()
+
+	type updateBody struct {
+		Title string `json:"title"`
+	}
+	body, err := json.Marshal(updateBody{Title: title})
+	if err != nil {
+		return fmt.Errorf("marshal update session: %w", err)
+	}
+
+	url := c.baseURL + "/session/" + sessionID
+	req, err := http.NewRequestWithContext(ctx, http.MethodPatch, url, bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("update session request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("update session: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("update session: HTTP %d: %s", resp.StatusCode, string(b))
+	}
+
+	c.log.Log("Session title set [session=%s]: %q", sessionID, title)
+	return nil
+}
+
+// sessionTitle derives a short title from the first query sent to a session.
+// Truncates at the last word boundary before maxLen runes.
+func sessionTitle(text string, maxLen int) string {
+	runes := []rune(strings.TrimSpace(text))
+	if len(runes) <= maxLen {
+		return string(runes)
+	}
+	truncated := string(runes[:maxLen])
+	if idx := strings.LastIndexAny(truncated, " \t\n"); idx > 0 {
+		truncated = truncated[:idx]
+	}
+	return truncated + "…"
+}
+
 // FileDiff holds the change summary for a single file in a session.
 // Before and After are the full file contents before/after the change;
 // retained to match the API response shape for future use (e.g. inline diffs).
@@ -263,6 +314,7 @@ func (c *Client) GetOrCreateSession(ctx context.Context, chatID int64) (string, 
 
 	c.mu.Lock()
 	c.sessions[chatID] = sid
+	c.newSessions[sid] = true
 	c.saveSessions()
 	c.mu.Unlock()
 
@@ -278,6 +330,7 @@ func (c *Client) SwitchMode(ctx context.Context, chatID int64, agent string) (st
 	}
 	c.mu.Lock()
 	c.sessions[chatID] = sid
+	c.newSessions[sid] = true
 	c.saveSessions()
 	c.mu.Unlock()
 	return sid, nil
@@ -708,6 +761,20 @@ func (c *Client) Query(ctx context.Context, chatID int64, text string, onChunk S
 	}
 
 	c.log.Log("QUERY [session=%s, chat=%d]: %s", sessionID, chatID, text)
+
+	// Auto-title new sessions from the first message.
+	c.mu.Lock()
+	isNew := c.newSessions[sessionID]
+	if isNew {
+		delete(c.newSessions, sessionID)
+	}
+	c.mu.Unlock()
+	if isNew {
+		title := sessionTitle(text, 50)
+		if err := c.UpdateSession(ctx, sessionID, title); err != nil {
+			c.log.Log("Session title update failed (non-fatal) [session=%s]: %v", sessionID, err)
+		}
+	}
 
 	type sseResult struct {
 		text string
