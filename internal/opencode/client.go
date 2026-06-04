@@ -177,6 +177,46 @@ func (c *Client) GetSession(chatID int64) (string, bool) {
 	return sid, ok
 }
 
+// FileDiff holds the change summary for a single file in a session.
+// Before and After are the full file contents before/after the change;
+// retained to match the API response shape for future use (e.g. inline diffs).
+type FileDiff struct {
+	File      string `json:"file"`
+	Before    string `json:"before"`
+	After     string `json:"after"`
+	Additions int    `json:"additions"`
+	Deletions int    `json:"deletions"`
+}
+
+// Diff returns the list of file changes made in the given session.
+func (c *Client) Diff(ctx context.Context, sessionID string) ([]FileDiff, error) {
+	ctx, cancel := context.WithTimeout(ctx, c.sessionTimeout)
+	defer cancel()
+
+	url := c.baseURL + "/session/" + sessionID + "/diff"
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("diff request: %w", err)
+	}
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("diff: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("diff: HTTP %d: %s", resp.StatusCode, string(body))
+	}
+
+	var diffs []FileDiff
+	if err := json.NewDecoder(resp.Body).Decode(&diffs); err != nil {
+		return nil, fmt.Errorf("diff decode: %w", err)
+	}
+	return diffs, nil
+}
+
 // Abort sends a POST /session/{id}/abort request, interrupting any active
 // processing in that session. It is safe to call even if no query is running.
 func (c *Client) Abort(ctx context.Context, sessionID string) error {
