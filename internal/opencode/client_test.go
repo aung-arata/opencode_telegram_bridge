@@ -745,6 +745,15 @@ func TestSessionTitle_NoSpaceTruncatesHard(t *testing.T) {
 	}
 }
 
+func TestSessionTitle_WhitespaceOnlyReturnsEmpty(t *testing.T) {
+	if got := sessionTitle("   ", 50); got != "" {
+		t.Fatalf("want empty string, got %q", got)
+	}
+	if got := sessionTitle("\t\n", 50); got != "" {
+		t.Fatalf("want empty string, got %q", got)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // UpdateSession / session naming
 // ---------------------------------------------------------------------------
@@ -944,6 +953,22 @@ func TestQuery_TitlesSessionAfterModeSwitch(t *testing.T) {
 	c.Query(ctx, 42, "plan query", nil, nil)
 	if titleCalls.Load() != 2 {
 		t.Fatalf("expected 2 PATCH after plan query, got %d", titleCalls.Load())
+	}
+}
+
+func TestQuery_WhitespaceMessageSkipsTitlePatch(t *testing.T) {
+	var titleCalls atomic.Int32
+	srv := buildQueryServerWithTitle(t, "ok", &titleCalls, nil)
+	defer srv.Close()
+
+	c := newTestClient(srv.URL)
+	// Whitespace-only message: title would be empty, PATCH should not fire.
+	_, err := c.Query(context.Background(), 42, "   ", nil, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if titleCalls.Load() != 0 {
+		t.Fatalf("expected 0 title PATCH calls for whitespace message, got %d", titleCalls.Load())
 	}
 }
 

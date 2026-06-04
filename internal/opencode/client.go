@@ -220,6 +220,9 @@ func (c *Client) applySessionTitle(ctx context.Context, sessionID, text string) 
 		return
 	}
 	title := sessionTitle(text, 50)
+	if title == "" {
+		return
+	}
 	if err := c.UpdateSession(ctx, sessionID, title); err != nil {
 		c.log.Log("Session title update failed (will retry next message) [session=%s]: %v", sessionID, err)
 		return
