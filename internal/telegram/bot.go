@@ -186,6 +186,9 @@ func (b *Bot) cmdAbort(ctx context.Context, chatID int64, replyTo int) {
 }
 
 // cmdDiff shows files changed in the current session via GET /session/:id/diff.
+// Does not acquire b.mu — read-only, and a mid-flight /newsession returning
+// stale diff data is acceptable for a diagnostic command.
+// sendReply uses plain text (no ParseMode), so filenames need no escaping.
 func (b *Bot) cmdDiff(ctx context.Context, chatID int64, replyTo int) {
 	sid, ok := b.oc.GetSession(chatID)
 	if !ok {

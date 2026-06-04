@@ -178,6 +178,8 @@ func (c *Client) GetSession(chatID int64) (string, bool) {
 }
 
 // FileDiff holds the change summary for a single file in a session.
+// Before and After are the full file contents before/after the change;
+// retained to match the API response shape for future use (e.g. inline diffs).
 type FileDiff struct {
 	File      string `json:"file"`
 	Before    string `json:"before"`
