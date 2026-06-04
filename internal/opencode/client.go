@@ -61,6 +61,12 @@ func NewClient(baseURL string, sessionTimeout time.Duration, log *logger.Logger,
 	return c
 }
 
+// sessionFileData is the on-disk format for sessions.json.
+type sessionFileData struct {
+	Sessions  map[string]string `json:"sessions"`  // chatID → sessionID
+	NeedTitle map[string]bool   `json:"needTitle"` // sessionID → true (pending first-message title)
+}
+
 // loadSessions reads persisted chatID→sessionID pairs from disk.
 func (c *Client) loadSessions() {
 	if c.sessionFile == "" {
@@ -70,6 +76,24 @@ func (c *Client) loadSessions() {
 	if err != nil {
 		return // file missing on first run — not an error
 	}
+
+	// Try new structured format first; fall back to legacy flat map.
+	var structured sessionFileData
+	if json.Unmarshal(data, &structured) == nil && structured.Sessions != nil {
+		for k, v := range structured.Sessions {
+			var chatID int64
+			if _, err := fmt.Sscanf(k, "%d", &chatID); err == nil {
+				c.sessions[chatID] = v
+			}
+		}
+		for sid := range structured.NeedTitle {
+			c.newSessions[sid] = true
+		}
+		c.log.Log("Loaded %d session(s) from %s (%d pending title)", len(c.sessions), c.sessionFile, len(c.newSessions))
+		return
+	}
+
+	// Legacy format: flat map[string]string.
 	var raw map[string]string
 	if err := json.Unmarshal(data, &raw); err != nil {
 		c.log.Log("session file parse error (ignored): %v", err)
@@ -89,11 +113,17 @@ func (c *Client) saveSessions() {
 	if c.sessionFile == "" {
 		return
 	}
-	raw := make(map[string]string, len(c.sessions))
-	for k, v := range c.sessions {
-		raw[fmt.Sprintf("%d", k)] = v
+	d := sessionFileData{
+		Sessions:  make(map[string]string, len(c.sessions)),
+		NeedTitle: make(map[string]bool, len(c.newSessions)),
 	}
-	data, err := json.Marshal(raw)
+	for k, v := range c.sessions {
+		d.Sessions[fmt.Sprintf("%d", k)] = v
+	}
+	for sid := range c.newSessions {
+		d.NeedTitle[sid] = true
+	}
+	data, err := json.Marshal(d)
 	if err != nil {
 		c.log.Log("session persist marshal error: %v", err)
 		return
@@ -177,6 +207,27 @@ func (c *Client) GetSession(chatID int64) (string, bool) {
 	defer c.mu.Unlock()
 	sid, ok := c.sessions[chatID]
 	return sid, ok
+}
+
+// applySessionTitle titles sessionID from text if it is in newSessions.
+// On success the flag is cleared. On PATCH failure the flag is kept so the
+// next query retries — non-fatal but recoverable.
+func (c *Client) applySessionTitle(ctx context.Context, sessionID, text string) {
+	c.mu.Lock()
+	isNew := c.newSessions[sessionID]
+	c.mu.Unlock()
+	if !isNew {
+		return
+	}
+	title := sessionTitle(text, 50)
+	if err := c.UpdateSession(ctx, sessionID, title); err != nil {
+		c.log.Log("Session title update failed (will retry next message) [session=%s]: %v", sessionID, err)
+		return
+	}
+	c.mu.Lock()
+	delete(c.newSessions, sessionID)
+	c.saveSessions()
+	c.mu.Unlock()
 }
 
 // UpdateSession sets metadata on an existing session. Currently used to set the title.
@@ -762,20 +813,6 @@ func (c *Client) Query(ctx context.Context, chatID int64, text string, onChunk S
 
 	c.log.Log("QUERY [session=%s, chat=%d]: %s", sessionID, chatID, text)
 
-	// Auto-title new sessions from the first message.
-	c.mu.Lock()
-	isNew := c.newSessions[sessionID]
-	if isNew {
-		delete(c.newSessions, sessionID)
-	}
-	c.mu.Unlock()
-	if isNew {
-		title := sessionTitle(text, 50)
-		if err := c.UpdateSession(ctx, sessionID, title); err != nil {
-			c.log.Log("Session title update failed (non-fatal) [session=%s]: %v", sessionID, err)
-		}
-	}
-
 	type sseResult struct {
 		text string
 		err  error
@@ -798,7 +835,10 @@ func (c *Client) Query(ctx context.Context, chatID int64, text string, onChunk S
 		resultCh <- sseResult{t, e}
 	}()
 
-	if err := c.SendMessage(ctx, sessionID, text); err != nil {
+	if err := c.SendMessage(ctx, sessionID, text); err == nil {
+		// Send succeeded — title the session now if it's new.
+		c.applySessionTitle(ctx, sessionID, text)
+	} else {
 		// Session might have expired; cancel SSE, recreate session, and retry.
 		c.log.Log("SendMessage failed [session=%s], creating new session: %v", sessionID, err)
 		sseCancel()
@@ -832,6 +872,8 @@ func (c *Client) Query(ctx context.Context, chatID int64, text string, onChunk S
 		if err := c.SendMessage(ctx, sessionID, text); err != nil {
 			return "", fmt.Errorf("send message (retry): %w", err)
 		}
+		// Title the recreated session now that send succeeded.
+		c.applySessionTitle(ctx, sessionID, text)
 	}
 
 	c.log.Log("SSE[%s] waiting for response...", sessionID)
