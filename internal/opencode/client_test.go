@@ -1117,3 +1117,70 @@ func TestRevert_HTTPError(t *testing.T) {
 		t.Fatal("expected error from 404 response")
 	}
 }
+
+// ---------------------------------------------------------------------------
+// ListSessions
+// ---------------------------------------------------------------------------
+
+func buildListSessionsServer(t *testing.T, sessions []map[string]string) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && r.URL.Path == "/session" {
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(sessions)
+			return
+		}
+		http.NotFound(w, r)
+	}))
+}
+
+func TestListSessions_ReturnsList(t *testing.T) {
+	sessions := []map[string]string{
+		{"id": "ses_1", "title": "Fix login bug"},
+		{"id": "ses_2", "title": "Refactor auth"},
+	}
+	srv := buildListSessionsServer(t, sessions)
+	defer srv.Close()
+
+	c := newTestClient(srv.URL)
+	got, err := c.ListSessions(context.Background())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("expected 2 sessions, got %d", len(got))
+	}
+	if got[0].ID != "ses_1" || got[0].Title != "Fix login bug" {
+		t.Fatalf("unexpected first session: %+v", got[0])
+	}
+	if got[1].ID != "ses_2" || got[1].Title != "Refactor auth" {
+		t.Fatalf("unexpected second session: %+v", got[1])
+	}
+}
+
+func TestListSessions_Empty(t *testing.T) {
+	srv := buildListSessionsServer(t, []map[string]string{})
+	defer srv.Close()
+
+	c := newTestClient(srv.URL)
+	got, err := c.ListSessions(context.Background())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("expected 0 sessions, got %d", len(got))
+	}
+}
+
+func TestListSessions_HTTPError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "server error", http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+
+	c := newTestClient(srv.URL)
+	_, err := c.ListSessions(context.Background())
+	if err == nil {
+		t.Fatal("expected error from 500 response")
+	}
+}
