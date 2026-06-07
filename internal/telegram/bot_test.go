@@ -333,3 +333,116 @@ func TestIsDangerous_BashMultiplePatterns_AnyDangerous(t *testing.T) {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// formatHistory
+// ---------------------------------------------------------------------------
+
+func TestFormatHistory_Empty(t *testing.T) {
+	// empty slice is handled before formatHistory is called, but ensure it doesn't panic
+	got := formatHistory([]opencode.MessageInfo{}, 20, 200)
+	if got == "" {
+		t.Fatal("expected non-empty output even for 0 messages")
+	}
+}
+
+func TestFormatHistory_Labels(t *testing.T) {
+	msgs := []opencode.MessageInfo{
+		{ID: "1", Role: "user", Text: "hello"},
+		{ID: "2", Role: "assistant", Text: "world"},
+	}
+	got := formatHistory(msgs, 20, 200)
+	if !strings.Contains(got, "[You]") {
+		t.Errorf("expected [You] label, got: %s", got)
+	}
+	if !strings.Contains(got, "[AI]") {
+		t.Errorf("expected [AI] label, got: %s", got)
+	}
+}
+
+func TestFormatHistory_NoText_Fallback(t *testing.T) {
+	msgs := []opencode.MessageInfo{
+		{ID: "1", Role: "user", Text: ""},
+	}
+	got := formatHistory(msgs, 20, 200)
+	if !strings.Contains(got, "(no text)") {
+		t.Errorf("expected (no text) fallback, got: %s", got)
+	}
+}
+
+func TestFormatHistory_SnippetTruncation(t *testing.T) {
+	long := strings.Repeat("z", 300)
+	msgs := []opencode.MessageInfo{
+		{ID: "1", Role: "user", Text: long},
+	}
+	got := formatHistory(msgs, 20, 200)
+	if !strings.Contains(got, "…") {
+		t.Errorf("expected truncation ellipsis, got: %s", got)
+	}
+	// snippet should be exactly 200 'z' runes, not 300
+	count := strings.Count(got, "z")
+	if count != 200 {
+		t.Errorf("expected exactly 200 chars in snippet, got %d", count)
+	}
+}
+
+func TestFormatHistory_SnippetExact_NoTruncation(t *testing.T) {
+	exact := strings.Repeat("b", 200)
+	msgs := []opencode.MessageInfo{
+		{ID: "1", Role: "user", Text: exact},
+	}
+	got := formatHistory(msgs, 20, 200)
+	if strings.Contains(got, "…") {
+		t.Errorf("expected no truncation for exactly 200 chars, got: %s", got)
+	}
+}
+
+func TestFormatHistory_MaxMsgsCap(t *testing.T) {
+	msgs := make([]opencode.MessageInfo, 25)
+	for i := range msgs {
+		msgs[i] = opencode.MessageInfo{ID: strconv.Itoa(i + 1), Role: "user", Text: "msg"}
+	}
+	got := formatHistory(msgs, 20, 200)
+	if !strings.Contains(got, "showing last 20") {
+		t.Errorf("expected truncation notice, got: %s", got)
+	}
+	// msg 1..5 dropped; first shown line should be "6. [You]"
+	// Use "\n6. [You]" to avoid false match from "16. [You]" etc.
+	if !strings.Contains(got, "\n6. [You]") {
+		t.Errorf("expected message #6 to be first shown, got: %s", got)
+	}
+	if strings.Contains(got, "\n5. [You]") {
+		t.Errorf("expected message #5 to be dropped, got: %s", got)
+	}
+}
+
+func TestFormatHistory_NoCapWhenUnder(t *testing.T) {
+	msgs := make([]opencode.MessageInfo, 5)
+	for i := range msgs {
+		msgs[i] = opencode.MessageInfo{ID: strconv.Itoa(i + 1), Role: "user", Text: "msg"}
+	}
+	got := formatHistory(msgs, 20, 200)
+	if strings.Contains(got, "showing last") {
+		t.Errorf("unexpected truncation notice for small list, got: %s", got)
+	}
+	if !strings.Contains(got, "5 message(s)") {
+		t.Errorf("expected count header, got: %s", got)
+	}
+}
+
+func TestFormatHistory_MultiByteTruncation(t *testing.T) {
+	// 300 Japanese runes — should truncate at 200 runes, not bytes
+	long := strings.Repeat("あ", 300)
+	msgs := []opencode.MessageInfo{
+		{ID: "1", Role: "user", Text: long},
+	}
+	got := formatHistory(msgs, 20, 200)
+	if !strings.Contains(got, "…") {
+		t.Errorf("expected truncation ellipsis for multibyte string")
+	}
+	runeCount := len([]rune(got))
+	// header + "1. [You] " + 200 runes + "…\n" — should be well under 300 runes of 'あ'
+	if runeCount > 250 {
+		t.Errorf("output too long (%d runes), multibyte truncation may be broken", runeCount)
+	}
+}
+

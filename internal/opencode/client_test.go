@@ -1184,3 +1184,105 @@ func TestListSessions_HTTPError(t *testing.T) {
 		t.Fatal("expected error from 500 response")
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Messages text extraction from parts
+// ---------------------------------------------------------------------------
+
+func buildMessagesWithPartsServer(t *testing.T, entries []interface{}) *httptest.Server {
+	t.Helper()
+	var sessionCalls atomic.Int32
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/session":
+			n := sessionCalls.Add(1)
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(createSessionResponse{ID: "ses_" + itoa(n)})
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/message"):
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(entries)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+}
+
+func TestMessages_ExtractsTextParts(t *testing.T) {
+	entries := []interface{}{
+		map[string]interface{}{
+			"info":  map[string]string{"id": "msg_1", "role": "user"},
+			"parts": []map[string]interface{}{{"type": "text", "text": "hello world"}},
+		},
+		map[string]interface{}{
+			"info": map[string]string{"id": "msg_2", "role": "assistant"},
+			"parts": []map[string]interface{}{
+				{"type": "step-start"},
+				{"type": "text", "text": "response text"},
+				{"type": "step-finish"},
+			},
+		},
+	}
+	srv := buildMessagesWithPartsServer(t, entries)
+	defer srv.Close()
+
+	c := newTestClient(srv.URL)
+	ctx := context.Background()
+	sid, _ := c.GetOrCreateSession(ctx, 42)
+	got, err := c.Messages(ctx, sid)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got[0].Text != "hello world" {
+		t.Fatalf("user message text: want %q, got %q", "hello world", got[0].Text)
+	}
+	if got[1].Text != "response text" {
+		t.Fatalf("assistant message text: want %q, got %q", "response text", got[1].Text)
+	}
+}
+
+func TestMessages_NoTextParts_EmptyText(t *testing.T) {
+	entries := []interface{}{
+		map[string]interface{}{
+			"info":  map[string]string{"id": "msg_1", "role": "user"},
+			"parts": []map[string]interface{}{{"type": "tool_use", "text": "ignored"}},
+		},
+	}
+	srv := buildMessagesWithPartsServer(t, entries)
+	defer srv.Close()
+
+	c := newTestClient(srv.URL)
+	ctx := context.Background()
+	sid, _ := c.GetOrCreateSession(ctx, 42)
+	got, err := c.Messages(ctx, sid)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got[0].Text != "" {
+		t.Fatalf("expected empty text for non-text parts, got %q", got[0].Text)
+	}
+}
+
+func TestMessages_MultipleTextParts_Joined(t *testing.T) {
+	entries := []interface{}{
+		map[string]interface{}{
+			"info": map[string]string{"id": "msg_1", "role": "assistant"},
+			"parts": []map[string]interface{}{
+				{"type": "text", "text": "first"},
+				{"type": "text", "text": "second"},
+			},
+		},
+	}
+	srv := buildMessagesWithPartsServer(t, entries)
+	defer srv.Close()
+
+	c := newTestClient(srv.URL)
+	ctx := context.Background()
+	sid, _ := c.GetOrCreateSession(ctx, 42)
+	got, err := c.Messages(ctx, sid)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got[0].Text != "first\nsecond" {
+		t.Fatalf("want %q, got %q", "first\nsecond", got[0].Text)
+	}
+}

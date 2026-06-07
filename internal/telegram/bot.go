@@ -304,9 +304,25 @@ func (b *Bot) cmdHistory(ctx context.Context, chatID int64, replyTo int) {
 		b.sendReply(chatID, replyTo, "No messages in current session.")
 		return
 	}
-	const snippetLen = 200
+	// sendReply uses plain text (no ParseMode), so message content renders literally.
+	b.sendReply(chatID, replyTo, formatHistory(msgs, 20, 200))
+}
+
+// formatHistory formats msgs into a numbered list capped at maxMsgs entries
+// (last N kept) with each message text truncated to snippetLen runes.
+func formatHistory(msgs []opencode.MessageInfo, maxMsgs, snippetLen int) string {
+	total := len(msgs)
+	truncated := total > maxMsgs
+	if truncated {
+		msgs = msgs[total-maxMsgs:]
+	}
 	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("💬 %d message(s):\n\n", len(msgs)))
+	if truncated {
+		fmt.Fprintf(&sb, "💬 %d message(s) (showing last %d):\n\n", total, maxMsgs)
+	} else {
+		fmt.Fprintf(&sb, "💬 %d message(s):\n\n", total)
+	}
+	offset := total - len(msgs)
 	for i, m := range msgs {
 		label := "You"
 		if m.Role == "assistant" {
@@ -318,10 +334,9 @@ func (b *Bot) cmdHistory(ctx context.Context, chatID int64, replyTo int) {
 		} else if len([]rune(text)) > snippetLen {
 			text = string([]rune(text)[:snippetLen]) + "…"
 		}
-		sb.WriteString(fmt.Sprintf("%d. [%s] %s\n", i+1, label, text))
+		fmt.Fprintf(&sb, "%d. [%s] %s\n", offset+i+1, label, text)
 	}
-	// sendReply uses plain text (no ParseMode), so message content renders literally.
-	b.sendReply(chatID, replyTo, sb.String())
+	return sb.String()
 }
 
 // lastUserMessageID returns the ID of the last message with role "user", or ""
