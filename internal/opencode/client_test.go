@@ -1009,3 +1009,111 @@ func TestSessionPersistence_NeedTitleSurvivesRestart(t *testing.T) {
 		t.Fatal("expected newSessions flag to survive restart via sessions.json")
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Messages / Revert
+// ---------------------------------------------------------------------------
+
+func buildMessagesServer(t *testing.T, msgs []map[string]string, revertCalled *atomic.Int32, revertGotID *string) *httptest.Server {
+	t.Helper()
+	var sessionCalls atomic.Int32
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/session":
+			n := sessionCalls.Add(1)
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(createSessionResponse{ID: "ses_" + itoa(n)})
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/message"):
+			w.Header().Set("Content-Type", "application/json")
+			var entries []map[string]interface{}
+			for _, m := range msgs {
+				entries = append(entries, map[string]interface{}{"info": m})
+			}
+			json.NewEncoder(w).Encode(entries)
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/revert"):
+			revertCalled.Add(1)
+			var body struct {
+				MessageID string `json:"messageID"`
+			}
+			json.NewDecoder(r.Body).Decode(&body)
+			if revertGotID != nil {
+				*revertGotID = body.MessageID
+			}
+			w.Header().Set("Content-Type", "application/json")
+			w.Write([]byte("{}"))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+}
+
+func TestMessages_ReturnsList(t *testing.T) {
+	msgs := []map[string]string{
+		{"id": "msg_1", "role": "user"},
+		{"id": "msg_2", "role": "assistant"},
+	}
+	var revertCalled atomic.Int32
+	srv := buildMessagesServer(t, msgs, &revertCalled, nil)
+	defer srv.Close()
+
+	c := newTestClient(srv.URL)
+	ctx := context.Background()
+	sid, _ := c.GetOrCreateSession(ctx, 42)
+	got, err := c.Messages(ctx, sid)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("expected 2 messages, got %d", len(got))
+	}
+	if got[0].ID != "msg_1" || got[0].Role != "user" {
+		t.Fatalf("unexpected first message: %+v", got[0])
+	}
+}
+
+func TestRevert_SendsLastUserMessageID(t *testing.T) {
+	msgs := []map[string]string{
+		{"id": "msg_1", "role": "user"},
+		{"id": "msg_2", "role": "assistant"},
+		{"id": "msg_3", "role": "user"},
+		{"id": "msg_4", "role": "assistant"},
+	}
+	var revertCalled atomic.Int32
+	var gotID string
+	srv := buildMessagesServer(t, msgs, &revertCalled, &gotID)
+	defer srv.Close()
+
+	c := newTestClient(srv.URL)
+	ctx := context.Background()
+	sid, _ := c.GetOrCreateSession(ctx, 42)
+
+	if err := c.Revert(ctx, sid, "msg_3"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if revertCalled.Load() != 1 {
+		t.Fatalf("expected 1 revert call, got %d", revertCalled.Load())
+	}
+	if gotID != "msg_3" {
+		t.Fatalf("expected messageID=msg_3, got %q", gotID)
+	}
+}
+
+func TestRevert_HTTPError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost && r.URL.Path == "/session" {
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(createSessionResponse{ID: "ses_1"})
+			return
+		}
+		http.Error(w, "not found", http.StatusNotFound)
+	}))
+	defer srv.Close()
+
+	c := newTestClient(srv.URL)
+	ctx := context.Background()
+	sid, _ := c.GetOrCreateSession(ctx, 42)
+	err := c.Revert(ctx, sid, "msg_1")
+	if err == nil {
+		t.Fatal("expected error from 404 response")
+	}
+}

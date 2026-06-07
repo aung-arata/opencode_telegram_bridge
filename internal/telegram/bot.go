@@ -130,6 +130,8 @@ func (b *Bot) handleMessage(ctx context.Context, msg *tgbotapi.Message) {
 		b.cmdNewSession(chatID, msgID)
 	case text == "/abort":
 		b.cmdAbort(ctx, chatID, msgID)
+	case text == "/undo":
+		b.cmdUndo(ctx, chatID, msgID)
 	case text == "/diff":
 		b.cmdDiff(ctx, chatID, msgID)
 	case text == "/plan":
@@ -155,6 +157,7 @@ func (b *Bot) cmdHelp(chatID int64, replyTo int) {
 		"Commands:\n" +
 		"/ask <query>  — explicit OpenCode query\n" +
 		"/abort        — cancel the running query\n" +
+		"/undo         — revert the last message and its file changes\n" +
 		"/diff         — show files changed in current session\n" +
 		"/plan         — switch to plan mode (read-only analysis)\n" +
 		"/build        — switch to build mode (full access, default)\n" +
@@ -211,6 +214,41 @@ func (b *Bot) cmdDiff(ctx context.Context, chatID int64, replyTo int) {
 		sb.WriteString(fmt.Sprintf("`%s` +%d -%d\n", d.File, d.Additions, d.Deletions))
 	}
 	b.sendReply(chatID, replyTo, sb.String())
+}
+
+// cmdUndo reverts the last user message and its file changes via
+// GET /session/:id/message (to find the last user messageID) then
+// POST /session/:id/revert.
+func (b *Bot) cmdUndo(ctx context.Context, chatID int64, replyTo int) {
+	sid, ok := b.oc.GetSession(chatID)
+	if !ok {
+		b.sendReply(chatID, replyTo, "⚠️ No active session.")
+		return
+	}
+	msgs, err := b.oc.Messages(ctx, sid)
+	if err != nil {
+		b.log.Log("Undo messages error [chat=%d session=%s]: %v", chatID, sid, err)
+		b.sendReply(chatID, replyTo, fmt.Sprintf("❌ Undo failed: %v", err))
+		return
+	}
+	// Find last user message to revert.
+	lastID := ""
+	for i := len(msgs) - 1; i >= 0; i-- {
+		if msgs[i].Role == "user" {
+			lastID = msgs[i].ID
+			break
+		}
+	}
+	if lastID == "" {
+		b.sendReply(chatID, replyTo, "⚠️ No messages to undo.")
+		return
+	}
+	if err := b.oc.Revert(ctx, sid, lastID); err != nil {
+		b.log.Log("Undo revert error [chat=%d session=%s]: %v", chatID, sid, err)
+		b.sendReply(chatID, replyTo, fmt.Sprintf("❌ Undo failed: %v", err))
+		return
+	}
+	b.sendReply(chatID, replyTo, "↩️ Last message reverted.")
 }
 
 // cmdNewSession drops the current OpenCode session so the next query starts fresh.
