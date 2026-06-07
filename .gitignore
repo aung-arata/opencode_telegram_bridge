@@ -7,3 +7,6 @@ __pycache__/
 bridge
 notify
 *.exe
+
+# Claude Code
+.claude/settings.local.json

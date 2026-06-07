@@ -713,3 +713,299 @@ func TestQuery_SendMessageFailure_ReturnError(t *testing.T) {
 		t.Fatal("expected error when message POST fails")
 	}
 }
+
+// ---------------------------------------------------------------------------
+// sessionTitle
+// ---------------------------------------------------------------------------
+
+func TestSessionTitle_Short(t *testing.T) {
+	got := sessionTitle("hello world", 50)
+	if got != "hello world" {
+		t.Fatalf("want %q, got %q", "hello world", got)
+	}
+}
+
+func TestSessionTitle_TruncatesAtWordBoundary(t *testing.T) {
+	got := sessionTitle("the quick brown fox jumped over the lazy dog", 20)
+	// Should truncate before 20 runes at last space, append "…"
+	if len([]rune(got)) > 21 { // 20 chars + "…"
+		t.Fatalf("result too long: %q", got)
+	}
+	if got[len(got)-3:] != "…" { // "…" is 3 bytes in UTF-8
+		t.Fatalf("expected trailing ellipsis, got %q", got)
+	}
+}
+
+func TestSessionTitle_NoSpaceTruncatesHard(t *testing.T) {
+	long := "abcdefghijklmnopqrstuvwxyz"
+	got := sessionTitle(long, 10)
+	// No spaces — hard truncate at maxLen + ellipsis
+	if got != "abcdefghij…" {
+		t.Fatalf("want %q, got %q", "abcdefghij…", got)
+	}
+}
+
+func TestSessionTitle_WhitespaceOnlyReturnsEmpty(t *testing.T) {
+	if got := sessionTitle("   ", 50); got != "" {
+		t.Fatalf("want empty string, got %q", got)
+	}
+	if got := sessionTitle("\t\n", 50); got != "" {
+		t.Fatalf("want empty string, got %q", got)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// UpdateSession / session naming
+// ---------------------------------------------------------------------------
+
+func TestUpdateSession_SetsTitle(t *testing.T) {
+	var gotTitle string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPatch && r.URL.Path == "/session/ses_1" {
+			var body struct {
+				Title string `json:"title"`
+			}
+			json.NewDecoder(r.Body).Decode(&body)
+			gotTitle = body.Title
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer srv.Close()
+
+	err := newTestClient(srv.URL).UpdateSession(context.Background(), "ses_1", "my title")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if gotTitle != "my title" {
+		t.Fatalf("want title %q, got %q", "my title", gotTitle)
+	}
+}
+
+func TestUpdateSession_HTTPError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "not found", http.StatusNotFound)
+	}))
+	defer srv.Close()
+
+	err := newTestClient(srv.URL).UpdateSession(context.Background(), "ses_x", "title")
+	if err == nil {
+		t.Fatal("expected error for HTTP 404")
+	}
+}
+
+// buildQueryServerWithTitle extends buildQueryServer with PATCH /session/:id support.
+// It records how many times the title endpoint is called and what title was set.
+func buildQueryServerWithTitle(t *testing.T, responseText string, titleCalls *atomic.Int32, lastTitle *string) *httptest.Server {
+	t.Helper()
+	var sessionCalls atomic.Int32
+
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/session":
+			n := sessionCalls.Add(1)
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(createSessionResponse{ID: "ses_" + itoa(n)})
+
+		case r.Method == http.MethodPatch && strings.HasPrefix(r.URL.Path, "/session/"):
+			titleCalls.Add(1)
+			var body struct {
+				Title string `json:"title"`
+			}
+			json.NewDecoder(r.Body).Decode(&body)
+			if lastTitle != nil {
+				*lastTitle = body.Title
+			}
+			w.WriteHeader(http.StatusOK)
+
+		case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/session/") && strings.HasSuffix(r.URL.Path, "/message"):
+			w.WriteHeader(http.StatusOK)
+
+		case r.Method == http.MethodGet && r.URL.Path == "/global/event":
+			sid := "ses_" + itoa(sessionCalls.Load())
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.Header().Set("Cache-Control", "no-cache")
+			w.(http.Flusher).Flush()
+			fmt.Fprintf(w, "data: %s\n\n", globalEventJSON(t, "message.part.delta",
+				partDeltaProperties{SessionID: sid, Field: "text", Delta: responseText}))
+			w.(http.Flusher).Flush()
+			fmt.Fprintf(w, "data: %s\n\n", globalEventJSON(t, "session.idle",
+				sessionEventProperties{SessionID: sid}))
+			w.(http.Flusher).Flush()
+
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+}
+
+func TestQuery_TitlesNewSessionOnFirstMessage(t *testing.T) {
+	var titleCalls atomic.Int32
+	var lastTitle string
+	srv := buildQueryServerWithTitle(t, "ok", &titleCalls, &lastTitle)
+	defer srv.Close()
+
+	c := newTestClient(srv.URL)
+	_, err := c.Query(context.Background(), 42, "what is Go?", nil, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if titleCalls.Load() != 1 {
+		t.Fatalf("expected 1 title PATCH call, got %d", titleCalls.Load())
+	}
+	if lastTitle == "" {
+		t.Fatal("expected non-empty title")
+	}
+}
+
+func TestQuery_DoesNotRetitleOnSecondMessage(t *testing.T) {
+	var titleCalls atomic.Int32
+	srv := buildQueryServerWithTitle(t, "ok", &titleCalls, nil)
+	defer srv.Close()
+
+	c := newTestClient(srv.URL)
+	ctx := context.Background()
+
+	c.Query(ctx, 42, "first message", nil, nil)
+	c.Query(ctx, 42, "second message", nil, nil)
+
+	if titleCalls.Load() != 1 {
+		t.Fatalf("expected exactly 1 title PATCH, got %d", titleCalls.Load())
+	}
+}
+
+func TestQuery_RetitleAfterPatchFailure(t *testing.T) {
+	var titleCalls atomic.Int32
+	patchFail := true
+
+	var sessionCalls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/session":
+			n := sessionCalls.Add(1)
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(createSessionResponse{ID: "ses_" + itoa(n)})
+		case r.Method == http.MethodPatch && strings.HasPrefix(r.URL.Path, "/session/"):
+			titleCalls.Add(1)
+			if patchFail {
+				http.Error(w, "server error", http.StatusInternalServerError)
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/message"):
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodGet && r.URL.Path == "/global/event":
+			sid := "ses_" + itoa(sessionCalls.Load())
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.(http.Flusher).Flush()
+			fmt.Fprintf(w, "data: %s\n\n", globalEventJSON(t, "message.part.delta",
+				partDeltaProperties{SessionID: sid, Field: "text", Delta: "ok"}))
+			w.(http.Flusher).Flush()
+			fmt.Fprintf(w, "data: %s\n\n", globalEventJSON(t, "session.idle",
+				sessionEventProperties{SessionID: sid}))
+			w.(http.Flusher).Flush()
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	c := newTestClient(srv.URL)
+	ctx := context.Background()
+
+	// First query — PATCH fails, flag kept.
+	c.Query(ctx, 42, "first", nil, nil)
+	if titleCalls.Load() != 1 {
+		t.Fatalf("expected 1 PATCH attempt after first query, got %d", titleCalls.Load())
+	}
+
+	// Second query — PATCH succeeds, flag cleared.
+	patchFail = false
+	c.Query(ctx, 42, "second", nil, nil)
+	if titleCalls.Load() != 2 {
+		t.Fatalf("expected 2 PATCH attempts total after retry, got %d", titleCalls.Load())
+	}
+
+	// Third query — flag cleared, no more PATCH.
+	c.Query(ctx, 42, "third", nil, nil)
+	if titleCalls.Load() != 2 {
+		t.Fatalf("expected no more PATCH after success, got %d", titleCalls.Load())
+	}
+}
+
+func TestQuery_TitlesSessionAfterModeSwitch(t *testing.T) {
+	var titleCalls atomic.Int32
+	srv := buildQueryServerWithTitle(t, "ok", &titleCalls, nil)
+	defer srv.Close()
+
+	c := newTestClient(srv.URL)
+	ctx := context.Background()
+
+	// First session — titled.
+	c.Query(ctx, 42, "build query", nil, nil)
+	if titleCalls.Load() != 1 {
+		t.Fatalf("expected 1 PATCH after build query, got %d", titleCalls.Load())
+	}
+
+	// Switch mode creates new session — should title again.
+	c.SwitchMode(ctx, 42, "plan")
+	c.Query(ctx, 42, "plan query", nil, nil)
+	if titleCalls.Load() != 2 {
+		t.Fatalf("expected 2 PATCH after plan query, got %d", titleCalls.Load())
+	}
+}
+
+func TestQuery_WhitespaceMessageSkipsTitlePatch(t *testing.T) {
+	var titleCalls atomic.Int32
+	srv := buildQueryServerWithTitle(t, "ok", &titleCalls, nil)
+	defer srv.Close()
+
+	c := newTestClient(srv.URL)
+	// Whitespace-only message: title would be empty, PATCH should not fire.
+	_, err := c.Query(context.Background(), 42, "   ", nil, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if titleCalls.Load() != 0 {
+		t.Fatalf("expected 0 title PATCH calls for whitespace message, got %d", titleCalls.Load())
+	}
+}
+
+func TestSessionPersistence_NeedTitleSurvivesRestart(t *testing.T) {
+	tmpFile := t.TempDir() + "/sessions.json"
+
+	var sessionCalls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost && r.URL.Path == "/session" {
+			n := sessionCalls.Add(1)
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(createSessionResponse{ID: "ses_" + itoa(n)})
+		} else {
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	// Create client, get session (marks as new), save to disk without sending first message.
+	c1 := NewClient(srv.URL, 5*time.Second, logger.New(""), tmpFile)
+	ctx := context.Background()
+	sid, _ := c1.GetOrCreateSession(ctx, 42)
+
+	// Verify flag was persisted.
+	c1.mu.Lock()
+	isNew := c1.newSessions[sid]
+	c1.mu.Unlock()
+	if !isNew {
+		t.Fatal("expected session to be marked new after GetOrCreateSession")
+	}
+
+	// Simulate restart: new client loads from same file.
+	c2 := NewClient(srv.URL, 5*time.Second, logger.New(""), tmpFile)
+	c2.mu.Lock()
+	isNewAfterRestart := c2.newSessions[sid]
+	c2.mu.Unlock()
+	if !isNewAfterRestart {
+		t.Fatal("expected newSessions flag to survive restart via sessions.json")
+	}
+}
