@@ -322,6 +322,47 @@ func (c *Client) Diff(ctx context.Context, sessionID string) ([]FileDiff, error)
 	return diffs, nil
 }
 
+// SessionSummary holds the id and title of a session returned by GET /session.
+type SessionSummary struct {
+	ID    string `json:"id"`
+	Title string `json:"title"`
+}
+
+// ListSessions returns all sessions known to the OpenCode server, newest first.
+func (c *Client) ListSessions(ctx context.Context) ([]SessionSummary, error) {
+	ctx, cancel := context.WithTimeout(ctx, c.sessionTimeout)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/session", nil)
+	if err != nil {
+		return nil, fmt.Errorf("list sessions request: %w", err)
+	}
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("list sessions: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("list sessions: HTTP %d: %s", resp.StatusCode, string(body))
+	}
+
+	var raw []struct {
+		ID    string `json:"id"`
+		Title string `json:"title"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
+		return nil, fmt.Errorf("list sessions decode: %w", err)
+	}
+	out := make([]SessionSummary, len(raw))
+	for i, r := range raw {
+		out[i] = SessionSummary{ID: r.ID, Title: r.Title}
+	}
+	return out, nil
+}
+
 // MessageInfo holds the metadata for a single message in a session.
 type MessageInfo struct {
 	ID   string `json:"id"`

@@ -132,6 +132,8 @@ func (b *Bot) handleMessage(ctx context.Context, msg *tgbotapi.Message) {
 		b.cmdAbort(ctx, chatID, msgID)
 	case text == "/undo":
 		b.cmdUndo(ctx, chatID, msgID)
+	case text == "/sessions":
+		b.cmdSessions(ctx, chatID, msgID)
 	case text == "/diff":
 		b.cmdDiff(ctx, chatID, msgID)
 	case text == "/plan":
@@ -158,6 +160,7 @@ func (b *Bot) cmdHelp(chatID int64, replyTo int) {
 		"/ask <query>  — explicit OpenCode query\n" +
 		"/abort        — cancel the running query\n" +
 		"/undo         — revert the last message and its file changes\n" +
+		"/sessions     — list all sessions with titles\n" +
 		"/diff         — show files changed in current session\n" +
 		"/plan         — switch to plan mode (read-only analysis)\n" +
 		"/build        — switch to build mode (full access, default)\n" +
@@ -246,6 +249,30 @@ func (b *Bot) cmdUndo(ctx context.Context, chatID int64, replyTo int) {
 		return
 	}
 	b.sendReply(chatID, replyTo, "↩️ Last message reverted.")
+}
+
+// cmdSessions lists all sessions known to the OpenCode server with their titles.
+func (b *Bot) cmdSessions(ctx context.Context, chatID int64, replyTo int) {
+	sessions, err := b.oc.ListSessions(ctx)
+	if err != nil {
+		b.log.Log("Sessions error [chat=%d]: %v", chatID, err)
+		b.sendReply(chatID, replyTo, fmt.Sprintf("❌ Sessions failed: %v", err))
+		return
+	}
+	if len(sessions) == 0 {
+		b.sendReply(chatID, replyTo, "No sessions found.")
+		return
+	}
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("📋 %d session(s):\n\n", len(sessions)))
+	for _, s := range sessions {
+		title := s.Title
+		if title == "" {
+			title = "(untitled)"
+		}
+		sb.WriteString(fmt.Sprintf("`%s` %s\n", s.ID, title))
+	}
+	b.sendReply(chatID, replyTo, sb.String())
 }
 
 // lastUserMessageID returns the ID of the last message with role "user", or ""
