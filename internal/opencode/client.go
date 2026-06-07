@@ -371,7 +371,13 @@ func (c *Client) Revert(ctx context.Context, sessionID, messageID string) error 
 	ctx, cancel := context.WithTimeout(ctx, c.sessionTimeout)
 	defer cancel()
 
-	body, _ := json.Marshal(map[string]string{"messageID": messageID})
+	type revertRequest struct {
+		MessageID string `json:"messageID"`
+	}
+	body, err := json.Marshal(revertRequest{MessageID: messageID})
+	if err != nil {
+		return fmt.Errorf("revert marshal: %w", err)
+	}
 	url := c.baseURL + "/session/" + sessionID + "/revert"
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {

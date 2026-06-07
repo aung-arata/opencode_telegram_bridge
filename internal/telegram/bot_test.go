@@ -218,6 +218,57 @@ func TestSaveLastUpdateID_LargeID(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// lastUserMessageID
+// ---------------------------------------------------------------------------
+
+func TestLastUserMessageID_Empty(t *testing.T) {
+	if got := lastUserMessageID(nil); got != "" {
+		t.Fatalf("want empty, got %q", got)
+	}
+}
+
+func TestLastUserMessageID_NoUserMessages(t *testing.T) {
+	msgs := []opencode.MessageInfo{
+		{ID: "a1", Role: "assistant"},
+		{ID: "a2", Role: "assistant"},
+	}
+	if got := lastUserMessageID(msgs); got != "" {
+		t.Fatalf("want empty when no user messages, got %q", got)
+	}
+}
+
+func TestLastUserMessageID_PicksLast(t *testing.T) {
+	msgs := []opencode.MessageInfo{
+		{ID: "u1", Role: "user"},
+		{ID: "a1", Role: "assistant"},
+		{ID: "u2", Role: "user"},
+		{ID: "a2", Role: "assistant"},
+	}
+	if got := lastUserMessageID(msgs); got != "u2" {
+		t.Fatalf("want u2, got %q", got)
+	}
+}
+
+func TestLastUserMessageID_LastIsAssistant(t *testing.T) {
+	msgs := []opencode.MessageInfo{
+		{ID: "u1", Role: "user"},
+		{ID: "a1", Role: "assistant"},
+	}
+	if got := lastUserMessageID(msgs); got != "u1" {
+		t.Fatalf("want u1 (last user msg), got %q", got)
+	}
+}
+
+func TestLastUserMessageID_OnlyOneUserMessage(t *testing.T) {
+	msgs := []opencode.MessageInfo{
+		{ID: "u1", Role: "user"},
+	}
+	if got := lastUserMessageID(msgs); got != "u1" {
+		t.Fatalf("want u1, got %q", got)
+	}
+}
+
+// ---------------------------------------------------------------------------
 // isDangerous / containsDangerousCommand
 // ---------------------------------------------------------------------------
 

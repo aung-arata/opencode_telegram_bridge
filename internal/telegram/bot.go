@@ -219,7 +219,11 @@ func (b *Bot) cmdDiff(ctx context.Context, chatID int64, replyTo int) {
 // cmdUndo reverts the last user message and its file changes via
 // GET /session/:id/message (to find the last user messageID) then
 // POST /session/:id/revert.
+// Acquires b.mu so it cannot race with an in-progress query or session switch.
 func (b *Bot) cmdUndo(ctx context.Context, chatID int64, replyTo int) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
 	sid, ok := b.oc.GetSession(chatID)
 	if !ok {
 		b.sendReply(chatID, replyTo, "⚠️ No active session.")
@@ -231,14 +235,7 @@ func (b *Bot) cmdUndo(ctx context.Context, chatID int64, replyTo int) {
 		b.sendReply(chatID, replyTo, fmt.Sprintf("❌ Undo failed: %v", err))
 		return
 	}
-	// Find last user message to revert.
-	lastID := ""
-	for i := len(msgs) - 1; i >= 0; i-- {
-		if msgs[i].Role == "user" {
-			lastID = msgs[i].ID
-			break
-		}
-	}
+	lastID := lastUserMessageID(msgs)
 	if lastID == "" {
 		b.sendReply(chatID, replyTo, "⚠️ No messages to undo.")
 		return
@@ -249,6 +246,17 @@ func (b *Bot) cmdUndo(ctx context.Context, chatID int64, replyTo int) {
 		return
 	}
 	b.sendReply(chatID, replyTo, "↩️ Last message reverted.")
+}
+
+// lastUserMessageID returns the ID of the last message with role "user", or ""
+// if none exists. Used by cmdUndo to find what to revert.
+func lastUserMessageID(msgs []opencode.MessageInfo) string {
+	for i := len(msgs) - 1; i >= 0; i-- {
+		if msgs[i].Role == "user" {
+			return msgs[i].ID
+		}
+	}
+	return ""
 }
 
 // cmdNewSession drops the current OpenCode session so the next query starts fresh.
