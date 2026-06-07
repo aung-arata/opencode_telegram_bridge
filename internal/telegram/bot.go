@@ -263,6 +263,11 @@ func (b *Bot) cmdSessions(ctx context.Context, chatID int64, replyTo int) {
 		b.sendReply(chatID, replyTo, "No sessions found.")
 		return
 	}
+	const maxSessions = 50
+	truncated := len(sessions) > maxSessions
+	if truncated {
+		sessions = sessions[:maxSessions]
+	}
 	var sb strings.Builder
 	sb.WriteString(fmt.Sprintf("📋 %d session(s):\n\n", len(sessions)))
 	for _, s := range sessions {
@@ -271,6 +276,9 @@ func (b *Bot) cmdSessions(ctx context.Context, chatID int64, replyTo int) {
 			title = "(untitled)"
 		}
 		sb.WriteString(fmt.Sprintf("`%s` %s\n", s.ID, title))
+	}
+	if truncated {
+		sb.WriteString(fmt.Sprintf("\n(showing first %d)", maxSessions))
 	}
 	b.sendReply(chatID, replyTo, sb.String())
 }

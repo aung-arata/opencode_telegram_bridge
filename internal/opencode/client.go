@@ -328,7 +328,7 @@ type SessionSummary struct {
 	Title string `json:"title"`
 }
 
-// ListSessions returns all sessions known to the OpenCode server, newest first.
+// ListSessions returns all sessions known to the OpenCode server in server-determined order.
 func (c *Client) ListSessions(ctx context.Context) ([]SessionSummary, error) {
 	ctx, cancel := context.WithTimeout(ctx, c.sessionTimeout)
 	defer cancel()
