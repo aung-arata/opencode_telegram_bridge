@@ -4,7 +4,8 @@
       "Bash(go build *)",
       "Bash(go test *)",
       "Bash(curl -s *)",
-      "Bash(curl -v *)"
+      "Bash(curl -v *)",
+      "Bash(gh pr merge *)"
     ]
   }
 }
