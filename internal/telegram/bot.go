@@ -134,6 +134,8 @@ func (b *Bot) handleMessage(ctx context.Context, msg *tgbotapi.Message) {
 		b.cmdUndo(ctx, chatID, msgID)
 	case text == "/sessions":
 		b.cmdSessions(ctx, chatID, msgID)
+	case text == "/history":
+		b.cmdHistory(ctx, chatID, msgID)
 	case text == "/diff":
 		b.cmdDiff(ctx, chatID, msgID)
 	case text == "/plan":
@@ -160,6 +162,7 @@ func (b *Bot) cmdHelp(chatID int64, replyTo int) {
 		"/ask <query>  — explicit OpenCode query\n" +
 		"/abort        — cancel the running query\n" +
 		"/undo         — revert the last message and its file changes\n" +
+		"/history      — show conversation history for current session\n" +
 		"/sessions     — list all sessions with titles\n" +
 		"/diff         — show files changed in current session\n" +
 		"/plan         — switch to plan mode (read-only analysis)\n" +
@@ -275,12 +278,65 @@ func (b *Bot) cmdSessions(ctx context.Context, chatID int64, replyTo int) {
 		if title == "" {
 			title = "(untitled)"
 		}
+		// sendReply uses plain text (no ParseMode), so backticks and title chars render literally.
 		sb.WriteString(fmt.Sprintf("`%s` %s\n", s.ID, title))
 	}
 	if truncated {
 		sb.WriteString(fmt.Sprintf("\n(showing first %d)", maxSessions))
 	}
 	b.sendReply(chatID, replyTo, sb.String())
+}
+
+// cmdHistory shows the conversation history for the current session.
+func (b *Bot) cmdHistory(ctx context.Context, chatID int64, replyTo int) {
+	sessionID, ok := b.oc.GetSession(chatID)
+	if !ok {
+		b.sendReply(chatID, replyTo, "⚠️ No active session.")
+		return
+	}
+	msgs, err := b.oc.Messages(ctx, sessionID)
+	if err != nil {
+		b.log.Log("History error [chat=%d]: %v", chatID, err)
+		b.sendReply(chatID, replyTo, fmt.Sprintf("❌ History failed: %v", err))
+		return
+	}
+	if len(msgs) == 0 {
+		b.sendReply(chatID, replyTo, "No messages in current session.")
+		return
+	}
+	// sendReply uses plain text (no ParseMode), so message content renders literally.
+	b.sendReply(chatID, replyTo, formatHistory(msgs, 20, 200))
+}
+
+// formatHistory formats msgs into a numbered list capped at maxMsgs entries
+// (last N kept) with each message text truncated to snippetLen runes.
+func formatHistory(msgs []opencode.MessageInfo, maxMsgs, snippetLen int) string {
+	total := len(msgs)
+	truncated := total > maxMsgs
+	if truncated {
+		msgs = msgs[total-maxMsgs:]
+	}
+	var sb strings.Builder
+	if truncated {
+		fmt.Fprintf(&sb, "💬 %d message(s) (showing last %d):\n\n", total, maxMsgs)
+	} else {
+		fmt.Fprintf(&sb, "💬 %d message(s):\n\n", total)
+	}
+	offset := total - len(msgs)
+	for i, m := range msgs {
+		label := "You"
+		if m.Role == "assistant" {
+			label = "AI"
+		}
+		text := m.Text
+		if text == "" {
+			text = "(no text)"
+		} else if len([]rune(text)) > snippetLen {
+			text = string([]rune(text)[:snippetLen]) + "…"
+		}
+		fmt.Fprintf(&sb, "%d. [%s] %s\n", offset+i+1, label, text)
+	}
+	return sb.String()
 }
 
 // lastUserMessageID returns the ID of the last message with role "user", or ""

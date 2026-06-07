@@ -19,7 +19,7 @@ Features ordered by impact. Items marked ✅ are shipped.
 
 7. ✅ **`/undo` command** — `POST /session/:id/revert` rolls back last message and its file changes
 8. ✅ **`/sessions` command** — `GET /session` lists sessions with titles; resume an old one by ID
-9. **`/history` command** — `GET /session/:id/message` shows conversation so far as a summary
+9. ✅ **`/history` command** — `GET /session/:id/message` shows conversation so far as a summary
 10. **Telegram 429 backoff** — current 1 edit/sec is hardcoded; add exponential backoff on rate-limit errors
 
 ---

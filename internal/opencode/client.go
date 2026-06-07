@@ -363,14 +363,21 @@ func (c *Client) ListSessions(ctx context.Context) ([]SessionSummary, error) {
 	return out, nil
 }
 
-// MessageInfo holds the metadata for a single message in a session.
+// MessageInfo holds the metadata and text content for a single message in a session.
 type MessageInfo struct {
 	ID   string `json:"id"`
 	Role string `json:"role"` // "user" or "assistant"
+	Text string // concatenated text from all "text"-type parts
+}
+
+type messagePart struct {
+	Type string `json:"type"`
+	Text string `json:"text"`
 }
 
 type messageEntry struct {
-	Info MessageInfo `json:"info"`
+	Info  MessageInfo   `json:"info"`
+	Parts []messagePart `json:"parts"`
 }
 
 // Messages returns the messages in a session, oldest first.
@@ -402,6 +409,16 @@ func (c *Client) Messages(ctx context.Context, sessionID string) ([]MessageInfo,
 	msgs := make([]MessageInfo, len(entries))
 	for i, e := range entries {
 		msgs[i] = e.Info
+		var sb strings.Builder
+		for _, p := range e.Parts {
+			if p.Type == "text" && p.Text != "" {
+				if sb.Len() > 0 {
+					sb.WriteByte('\n')
+				}
+				sb.WriteString(p.Text)
+			}
+		}
+		msgs[i].Text = sb.String()
 	}
 	return msgs, nil
 }
