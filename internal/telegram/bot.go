@@ -134,6 +134,8 @@ func (b *Bot) handleMessage(ctx context.Context, msg *tgbotapi.Message) {
 		b.cmdUndo(ctx, chatID, msgID)
 	case text == "/sessions":
 		b.cmdSessions(ctx, chatID, msgID)
+	case text == "/history":
+		b.cmdHistory(ctx, chatID, msgID)
 	case text == "/diff":
 		b.cmdDiff(ctx, chatID, msgID)
 	case text == "/plan":
@@ -160,6 +162,7 @@ func (b *Bot) cmdHelp(chatID int64, replyTo int) {
 		"/ask <query>  — explicit OpenCode query\n" +
 		"/abort        — cancel the running query\n" +
 		"/undo         — revert the last message and its file changes\n" +
+		"/history      — show conversation history for current session\n" +
 		"/sessions     — list all sessions with titles\n" +
 		"/diff         — show files changed in current session\n" +
 		"/plan         — switch to plan mode (read-only analysis)\n" +
@@ -275,11 +278,49 @@ func (b *Bot) cmdSessions(ctx context.Context, chatID int64, replyTo int) {
 		if title == "" {
 			title = "(untitled)"
 		}
+		// sendReply uses plain text (no ParseMode), so backticks and title chars render literally.
 		sb.WriteString(fmt.Sprintf("`%s` %s\n", s.ID, title))
 	}
 	if truncated {
 		sb.WriteString(fmt.Sprintf("\n(showing first %d)", maxSessions))
 	}
+	b.sendReply(chatID, replyTo, sb.String())
+}
+
+// cmdHistory shows the conversation history for the current session.
+func (b *Bot) cmdHistory(ctx context.Context, chatID int64, replyTo int) {
+	sessionID, ok := b.oc.GetSession(chatID)
+	if !ok {
+		b.sendReply(chatID, replyTo, "⚠️ No active session.")
+		return
+	}
+	msgs, err := b.oc.Messages(ctx, sessionID)
+	if err != nil {
+		b.log.Log("History error [chat=%d]: %v", chatID, err)
+		b.sendReply(chatID, replyTo, fmt.Sprintf("❌ History failed: %v", err))
+		return
+	}
+	if len(msgs) == 0 {
+		b.sendReply(chatID, replyTo, "No messages in current session.")
+		return
+	}
+	const snippetLen = 200
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("💬 %d message(s):\n\n", len(msgs)))
+	for i, m := range msgs {
+		label := "You"
+		if m.Role == "assistant" {
+			label = "AI"
+		}
+		text := m.Text
+		if text == "" {
+			text = "(no text)"
+		} else if len([]rune(text)) > snippetLen {
+			text = string([]rune(text)[:snippetLen]) + "…"
+		}
+		sb.WriteString(fmt.Sprintf("%d. [%s] %s\n", i+1, label, text))
+	}
+	// sendReply uses plain text (no ParseMode), so message content renders literally.
 	b.sendReply(chatID, replyTo, sb.String())
 }
 
