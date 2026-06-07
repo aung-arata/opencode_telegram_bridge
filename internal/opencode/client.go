@@ -322,6 +322,84 @@ func (c *Client) Diff(ctx context.Context, sessionID string) ([]FileDiff, error)
 	return diffs, nil
 }
 
+// MessageInfo holds the metadata for a single message in a session.
+type MessageInfo struct {
+	ID   string `json:"id"`
+	Role string `json:"role"` // "user" or "assistant"
+}
+
+type messageEntry struct {
+	Info MessageInfo `json:"info"`
+}
+
+// Messages returns the messages in a session, oldest first.
+func (c *Client) Messages(ctx context.Context, sessionID string) ([]MessageInfo, error) {
+	ctx, cancel := context.WithTimeout(ctx, c.sessionTimeout)
+	defer cancel()
+
+	url := c.baseURL + "/session/" + sessionID + "/message"
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("messages request: %w", err)
+	}
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("messages: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("messages: HTTP %d: %s", resp.StatusCode, string(body))
+	}
+
+	var entries []messageEntry
+	if err := json.NewDecoder(resp.Body).Decode(&entries); err != nil {
+		return nil, fmt.Errorf("messages decode: %w", err)
+	}
+	msgs := make([]MessageInfo, len(entries))
+	for i, e := range entries {
+		msgs[i] = e.Info
+	}
+	return msgs, nil
+}
+
+// Revert rolls back the given message and any file changes it caused.
+// Pass the ID of the user message to undo.
+func (c *Client) Revert(ctx context.Context, sessionID, messageID string) error {
+	ctx, cancel := context.WithTimeout(ctx, c.sessionTimeout)
+	defer cancel()
+
+	type revertRequest struct {
+		MessageID string `json:"messageID"`
+	}
+	body, err := json.Marshal(revertRequest{MessageID: messageID})
+	if err != nil {
+		return fmt.Errorf("revert marshal: %w", err)
+	}
+	url := c.baseURL + "/session/" + sessionID + "/revert"
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("revert request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("revert: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("revert: HTTP %d: %s", resp.StatusCode, string(body))
+	}
+
+	c.log.Log("Revert sent [session=%s message=%s]", sessionID, messageID)
+	return nil
+}
+
 // Abort sends a POST /session/{id}/abort request, interrupting any active
 // processing in that session. It is safe to call even if no query is running.
 func (c *Client) Abort(ctx context.Context, sessionID string) error {
